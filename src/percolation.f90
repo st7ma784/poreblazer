@@ -87,11 +87,15 @@ Contains
         Integer                                      :: i, j, k, l, LX, LY, LZ, scenario, ncold, trcli, icount, i1
         Logical :: loop
         Real :: xr, yr, zr
-        Integer, Dimension(:), allocatable                                             :: clink
+        Integer, Dimension(:), allocatable                                             :: newlabel
 
 
-        allocate(clink(100000))
-        clink = 0
+        ! newlabel(t) is the final label of the clusters whose root label is t (0 until the
+        ! first site of that cluster is met). Upstream searched a list of the labels so far
+        ! for every site, which is quadratic in the number of clusters and overflowed after
+        ! 100000 clusters; the labels are the same.
+        allocate(newlabel(size(trcl)))
+        newlabel = 0
 
         LX = size(ngrid,1)
         LY = size(ngrid,2)
@@ -127,22 +131,12 @@ Contains
                         If(ngrid(i,j,k) == 0) cycle
                         icount =  icount + 1
                         trcli = trcl(cluster(i, j, k))
-                        loop = .false.
-
-                        do i1=1, nc
-                        if(clink(i1) == trcli) then
-                        cluster(i, j, k) = i1
-                        cl(i1) = cl(i1) + 1
-                        loop = .true.
-                        exit
+                        if(newlabel(trcli) == 0) then
+                            nc = nc + 1
+                            newlabel(trcli) = nc
                         end if
-                        end do
-
-                        if(loop) cycle
-                        nc = nc + 1
-                        cluster(i, j, k) = nc
-                        cl(nc) = cl(nc) + 1
-                        clink(nc) = trcli
+                        cluster(i, j, k) = newlabel(trcli)
+                        cl(newlabel(trcli)) = cl(newlabel(trcli)) + 1
                 end do
             end do
         end do
@@ -170,7 +164,7 @@ Contains
 !            If(nc==ncold) exit
 !         end do
 !     print*, "hello2"
-     deallocate(clink)
+     deallocate(newlabel)
      End Subroutine clusteranalysis
 
 !---------------------------------------------------------------------

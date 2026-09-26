@@ -414,18 +414,21 @@ subroutine lattice_calculations
     use lattice
 
     use defaults, only:     rdbl
-    use fundcell, only:     fundamental_cell, fundcell_snglminimage
+    use fundcell, only:     fundamental_cell, fundcell_snglminimage, fundcell_isortho
     use vector, only:       vectype
-    use percolation, only:  percolation_calc, percolation_calc_simple
 
     implicit none
 
-    character(20)                      :: filename1, filename2, filename3
-    type(vectype)                      :: atvec1, atvec2, sepvec
-    real*8                             :: rdist, rdist2, rdist6, rdist12, rdist2_ref, rdist_surface, rdist_surface_ref
-    real*8                             :: sigma, sigma6, sigma12,  sig2_rdist2, lj_energy
-    integer*4                          :: i, j, k, l, icount, nstep,amin
-    logical                            :: overlap
+    real*8, parameter                  :: cell_target = 2.0d0       ! width of the cell-list cells (A)
+    real*8, parameter                  :: margin = 1.0d-3           ! cells are searched to hicut + margin (A)
+    real*8                             :: maxsigma, reach, s, x, cellw(3)
+    integer*4                          :: i, j, k, l, icount, a, b, d, n, o, ix, iy, iz, ncand, ncells, maxnb
+    integer                            :: c(3), ncell(3), ncubes(3), nnb(3), m(3)
+    logical                            :: exact
+    integer, allocatable               :: atom_cell(:), cell_start(:), fill(:), cell_atoms(:), all_atoms(:)
+    integer, allocatable               :: pfirst(:,:), plast(:,:), nbr(:,:), cand(:)
+    real*8, allocatable                :: gap(:,:)
+    logical, allocatable               :: mark(:)
 
 
     write(*,*) "!-------------------------------------------------------!"
@@ -434,81 +437,136 @@ subroutine lattice_calculations
     write(*,*)
 
     ! Each cubelet writes only its own elements of the lattice arrays, so the cubelets are
-    ! independent and run in parallel. Every temporary is private: in upstream 3.0.5 the
-    ! Lennard-Jones temporaries were shared between threads (a race, and slow, as every
-    ! thread wrote the same variables), and the cubelet lists were filled with a counter
-    ! read after other threads could have incremented it. The lists are now built
-    ! afterwards, in cubelet order, so the results do not depend on the number of threads.
-    !$omp parallel do collapse(3) default(shared) schedule(static) &
-    !$omp private(i, j, k, l, icount, overlap, amin, rdist2, rdist2_ref, rdist_surface, &
-    !$omp rdist_surface_ref, sig2_rdist2, rdist6, rdist12, lj_energy, atvec1, sepvec)
-    do l=1, ncubesz                                    ! we go cubelet by cubelet
-        do k=1, ncubesy
-            do j=1, ncubesx
+    ! independent and run in parallel. In upstream 3.0.5 the Lennard-Jones temporaries were
+    ! shared between threads (a race, and slow, as every thread wrote the same variables),
+    ! and the cubelet lists were filled with a counter read after other threads could have
+    ! incremented it. The lists are now built afterwards, in cubelet order, so the results
+    ! do not depend on the number of threads.
+    !
+    ! Cell list: the atoms are binned into cells about cell_target A wide and the cubelets
+    ! are processed cell by cell. Each cubelet checks only the atoms in cells that can lie
+    ! within the cutoff, in ascending atom order, so the Lennard-Jones sum, the overlap test
+    ! and the nearest atom are exactly those found by checking every atom. When the nearest
+    ! atom or the nearest surface could lie beyond the cutoff (a pore wider than about twice
+    ! the cutoff), the cubelet checks every atom instead, as upstream does. The list is used
+    ! for orthorhombic cells only, where the minimum image is taken component by component;
+    ! other cells use a single cell, i.e. every atom.
+    maxsigma = maxval(asigma)
+    reach = hicut + margin
+    ncell = 1
+    cellw = fcell%ell
+    if(fundcell_isortho(fcell) .and. 0.5*maxsigma < hicut) then
+        do d=1, 3
+            ncell(d) = max(1, int(fcell%ell(d)/cell_target))
+            cellw(d) = fcell%ell(d)/dble(ncell(d))
+        end do
+    end if
+    ncells = ncell(1)*ncell(2)*ncell(3)
+    ncubes = (/ ncubesx, ncubesy, ncubesz /)
+    maxnb = maxval(ncell)
 
-                icount = ((l-1) * ncubesx * ncubesy) + ((k-1) * ncubesx) + j                                ! count cubelets
-                ! create a look-up table connecting the cubelet number with its indicies
-                lattice_index(:, icount) = (/ j, k, l /)
+    ! Atoms of each cell, in ascending atom order
+    allocate(atom_cell(natoms), cell_start(ncells+1), fill(ncells), cell_atoms(natoms), all_atoms(natoms))
+    cell_start = 0
+    do i=1, natoms
+        all_atoms(i) = i
+        do d=1, 3
+            s = matvec(i)%comp(d) - fcell%ell(d)*floor(matvec(i)%comp(d)/fcell%ell(d))
+            c(d) = max(0, min(int(s/cellw(d)), ncell(d)-1))
+        end do
+        atom_cell(i) = 1 + c(1) + ncell(1)*(c(2) + ncell(2)*c(3))
+        cell_start(atom_cell(i)+1) = cell_start(atom_cell(i)+1) + 1
+    end do
+    cell_start(1) = 1
+    do n=1, ncells
+        cell_start(n+1) = cell_start(n+1) + cell_start(n)
+    end do
+    fill = cell_start(1:ncells)
+    do i=1, natoms
+        cell_atoms(fill(atom_cell(i))) = i
+        fill(atom_cell(i)) = fill(atom_cell(i)) + 1
+    end do
 
-                ! calculate the coordinates of the center of each cubelet
-                atvec1%comp = (/dble(j-1), dble(k-1), dble(l-1)/) * cube_size + (0.5 * cube_size)
+    ! Range of cubelets in each cell along each side
+    allocate(pfirst(0:maxnb-1, 3), plast(0:maxnb-1, 3))
+    pfirst = 1
+    plast = 0
+    do d=1, 3
+        do j=ncubes(d), 1, -1
+            x = dble(j-1)*cube_size + (0.5*cube_size)
+            a = max(0, min(int(x/cellw(d)), ncell(d)-1))
+            pfirst(a, d) = j
+            if(plast(a, d) < j) plast(a, d) = j
+        end do
+    end do
 
-                overlap = .False.
-
-                amin = 1
-                rdist2_ref = huge(0.0d0)
-                rdist_surface_ref = huge(0.0d0)
-
-                do i=1, natoms                                     ! for each cubelet go through the whole set of atoms of the adsorbent structure
-
-                    call fundcell_snglMinImage(fcell,atvec1,matvec(i),sepvec,rdist2)     ! calculate the distance between each atom and center of cubelet icount
-
-                    ! First check if the point is "inside" a sphere
-                    if(rdist2<0.25*asigma2(atype(i))) then             ! ignore the cubelet icount if it is "inside" an atom
-                        overlap=.True.
-                        exit
-                    end if
-
-                    if(rdist2<rdist2_ref) then                         ! in the next few lines we identify if the returned distance squared rdist2 is the smallest so far between
-                        rdist2_ref = rdist2                            ! cubelet icount and an atom of the structure, without an overlap
-                        amin = i
-                    end if
-
-                    rdist_surface = sqrt(rdist2)- 0.5*asigma(atype(i))
-
-                    if(rdist_surface<rdist_surface_ref) then
-                        rdist_surface_ref = rdist_surface
-                    end if
-
-                    if(rdist2<hicut2) then                            ! ignore the atom i if it is beyond the cutoff radius
-                        sig2_rdist2 = asigma2_he(atype(i))/rdist2         ! if an atom is within the cut-off, this is a convinient place to calculate its Lennard-Jones interaction
-                        rdist6 = sig2_rdist2*sig2_rdist2*sig2_rdist2                         ! with a helium atom placed in the center of the cubelet icount for later use in the helium volume calculation
-                        rdist12 = rdist6*rdist6                           ! based in the second virial approach
-                        lj_energy  = aeps_he(atype(i))*(rdist12-rdist6)
-                        lattice_lj_he(icount) = lattice_lj_he(icount) + lj_energy
+    !$omp parallel default(shared) private(a, b, c, d, n, o, ix, iy, iz, j, k, l, ncand, nnb, m, exact, &
+    !$omp nbr, gap, mark, cand)
+    allocate(nbr(maxnb, 3), gap(maxnb, 3), mark(natoms), cand(natoms))
+    mark = .False.
+    !$omp do collapse(3) schedule(dynamic)
+    do iz=0, ncell(3)-1
+        do iy=0, ncell(2)-1
+            do ix=0, ncell(1)-1
+                ! Neighbouring cells along each side, with the smallest gap between a point in
+                ! this cell and a point in the neighbour (periodic, each cell once)
+                c = (/ ix, iy, iz /)
+                do d=1, 3
+                    nnb(d) = 0
+                    m(d) = int(reach/cellw(d)) + 1
+                    if(2*m(d)+1 >= ncell(d)) then
+                        do b=0, ncell(d)-1
+                            o = abs(b - c(d))
+                            o = min(o, ncell(d) - o)
+                            nnb(d) = nnb(d) + 1
+                            nbr(nnb(d), d) = b
+                            gap(nnb(d), d) = max(0, o-1)*cellw(d)
+                        end do
+                    else
+                        do o=-m(d), m(d)
+                            nnb(d) = nnb(d) + 1
+                            nbr(nnb(d), d) = modulo(c(d) + o, ncell(d))
+                            gap(nnb(d), d) = max(0, abs(o)-1)*cellw(d)
+                        end do
                     end if
                 end do
 
-                if(overlap.eqv..True.) then                          ! if in the previous cycle an overlap was detected, this whole cubelet is ignored
-                    cycle
-                end if
+                ! Candidate atoms: those in cells closer than the cutoff, in ascending order
+                do l=1, nnb(3)
+                    do k=1, nnb(2)
+                        do j=1, nnb(1)
+                            if(gap(j,1)**2 + gap(k,2)**2 + gap(l,3)**2 >= reach*reach) cycle
+                            b = 1 + nbr(j,1) + ncell(1)*(nbr(k,2) + ncell(2)*nbr(l,3))
+                            do n=cell_start(b), cell_start(b+1)-1
+                                mark(cell_atoms(n)) = .True.
+                            end do
+                        end do
+                    end do
+                end do
+                ncand = 0
+                do n=1, natoms
+                    if(mark(n)) then
+                        ncand = ncand + 1
+                        cand(ncand) = n
+                        mark(n) = .False.
+                    end if
+                end do
 
-                lattice_space(j,k,l) = 1                          ! otherwise the cubelet is geometrically accessible
-
-                lattice_rdist2(j,k,l) = rdist_surface_ref*rdist_surface_ref ! lattice_rdist2(j,k,l) stores the shortest squared distance between cubelet j, k, l and nearest atom (without overlap)
-
-                if(rdist2_ref>0.25*asigma2_he(atype(amin))) then  ! accessible to a helium atom
-                    lattice_space_he(j,k,l) = 1
-                end if
-
-                if(rdist2_ref>asigma2_n(atype(amin))) then        ! accessible to a nitrogen atom
-                    lattice_space_n(j,k,l) = 1
-                end if
-
+                do l=pfirst(iz,3), plast(iz,3)
+                    do k=pfirst(iy,2), plast(iy,2)
+                        do j=pfirst(ix,1), plast(ix,1)
+                            call lattice_cube(j, k, l, cand, ncand, exact)
+                            if(.not. exact) call lattice_cube(j, k, l, all_atoms, natoms, exact)
+                        end do
+                    end do
+                end do
             end do
         end do
     end do
-    !$omp end parallel do
+    !$omp end do
+    deallocate(nbr, gap, mark, cand)
+    !$omp end parallel
+    deallocate(atom_cell, cell_start, fill, cell_atoms, all_atoms, pfirst, plast)
 
     ! Lists of geometrically, helium- and nitrogen-accessible cubelets, in cubelet order
     do l=1, ncubesz
@@ -538,6 +596,91 @@ subroutine lattice_calculations
     write(*,*)
 
     return
+
+contains
+
+    ! One cubelet, checking the atoms in list(1:nlist) (in ascending order). exact is false,
+    ! and nothing is stored, when an atom outside the list could still be the nearest atom
+    ! or give the nearest surface; the list always holds every atom within the cutoff, so
+    ! the overlap test and the Lennard-Jones sum are exact either way.
+    subroutine lattice_cube(j, k, l, list, nlist, exact)
+        integer, intent(in)                :: j, k, l, nlist
+        integer, intent(in)                :: list(:)
+        logical, intent(out)               :: exact
+        type(vectype)                      :: atvec1, sepvec
+        real*8                             :: rdist2, rdist6, rdist12, rdist2_ref, rdist_surface, rdist_surface_ref
+        real*8                             :: sig2_rdist2, lj_energy, lj_sum
+        integer                            :: i, n, icount, amin
+        logical                            :: overlap
+
+        icount = ((l-1) * ncubesx * ncubesy) + ((k-1) * ncubesx) + j                                ! count cubelets
+
+        ! calculate the coordinates of the center of each cubelet
+        atvec1%comp = (/dble(j-1), dble(k-1), dble(l-1)/) * cube_size + (0.5 * cube_size)
+
+        overlap = .False.
+
+        amin = 1
+        rdist2_ref = huge(0.0d0)
+        rdist_surface_ref = huge(0.0d0)
+        lj_sum = 0.0d0
+
+        do n=1, nlist                                      ! for each cubelet go through the atoms of the adsorbent structure
+            i = list(n)
+
+            call fundcell_snglMinImage(fcell,atvec1,matvec(i),sepvec,rdist2)     ! calculate the distance between each atom and center of cubelet icount
+
+            ! First check if the point is "inside" a sphere
+            if(rdist2<0.25*asigma2(atype(i))) then             ! ignore the cubelet icount if it is "inside" an atom
+                overlap=.True.
+                exit
+            end if
+
+            if(rdist2<rdist2_ref) then                         ! in the next few lines we identify if the returned distance squared rdist2 is the smallest so far between
+                rdist2_ref = rdist2                            ! cubelet icount and an atom of the structure, without an overlap
+                amin = i
+            end if
+
+            rdist_surface = sqrt(rdist2)- 0.5*asigma(atype(i))
+
+            if(rdist_surface<rdist_surface_ref) then
+                rdist_surface_ref = rdist_surface
+            end if
+
+            if(rdist2<hicut2) then                            ! ignore the atom i if it is beyond the cutoff radius
+                sig2_rdist2 = asigma2_he(atype(i))/rdist2         ! if an atom is within the cut-off, this is a convinient place to calculate its Lennard-Jones interaction
+                rdist6 = sig2_rdist2*sig2_rdist2*sig2_rdist2                         ! with a helium atom placed in the center of the cubelet icount for later use in the helium volume calculation
+                rdist12 = rdist6*rdist6                           ! based in the second virial approach
+                lj_energy  = aeps_he(atype(i))*(rdist12-rdist6)
+                lj_sum = lj_sum + lj_energy
+            end if
+        end do
+
+        exact = overlap .or. nlist == natoms .or. &
+                (rdist2_ref < hicut2 .and. rdist_surface_ref + 0.5*maxsigma < hicut)
+        if(.not. exact) return
+
+        ! create a look-up table connecting the cubelet number with its indicies
+        lattice_index(:, icount) = (/ j, k, l /)
+        lattice_lj_he(icount) = lj_sum
+
+        if(overlap.eqv..True.) then                          ! if an overlap was detected, this whole cubelet is ignored
+            return
+        end if
+
+        lattice_space(j,k,l) = 1                          ! otherwise the cubelet is geometrically accessible
+
+        lattice_rdist2(j,k,l) = rdist_surface_ref*rdist_surface_ref ! lattice_rdist2(j,k,l) stores the shortest squared distance between cubelet j, k, l and nearest atom (without overlap)
+
+        if(rdist2_ref>0.25*asigma2_he(atype(amin))) then  ! accessible to a helium atom
+            lattice_space_he(j,k,l) = 1
+        end if
+
+        if(rdist2_ref>asigma2_n(atype(amin))) then        ! accessible to a nitrogen atom
+            lattice_space_n(j,k,l) = 1
+        end if
+
+    end subroutine lattice_cube
 
 end subroutine lattice_calculations
 
@@ -881,7 +1024,15 @@ subroutine pore_distribution
         end do
     end do
 
-    call sort(ng_cubes,PA1,PA2,PA3,PA4)
+    ! Sorted on threads. The order of cubelets with equal distances can differ from the
+    ! serial sort, which changes nothing: the search below takes the distance of the first
+    ! containing sphere, the same for every cubelet with that distance, and the limiting
+    ! diameter uses only the distances.
+    !$omp parallel default(shared)
+    !$omp single
+    call parallel_sort(1, ng_cubes, PA1, PA2, PA3, PA4)
+    !$omp end single
+    !$omp end parallel
 
     if (nn_cubes == 0) then
         ! If there are no nitrogen-accessible cubes, the pore size is zero.
@@ -1106,6 +1257,7 @@ subroutine nitrogen_lattice_vis(option)
     integer                            :: ncx, ncy, ncz
     real                               :: x, y, z, field
     type(vectype)                      :: atvec1
+    real, allocatable                  :: plane(:,:)
 
     
     if(option==1) then
@@ -1156,20 +1308,24 @@ subroutine nitrogen_lattice_vis(option)
 
     write(111,*) "1 ",  " 0 ", ncx, " 0 ", ncy, " 0 ", ncz
 
+   ! One write statement per plane (one record per value by format reversion) instead of
+   ! one per cubelet: the same file, about 30% faster. The formatting itself is most of
+   ! what is left, and libgfortran serialises it, so formatting on threads is slower.
+   allocate(plane(ncubesx, ncubesy))
    do k=1,  ncubesz
     do j=1, ncubesy
      do i=1, ncubesx
 
        if(lattice_rdist2(i,j,k) == 0.0) then
-       field = 0.0
-       write(111,'(e12.5)') field
+       plane(i,j) = 0.0
        else
-       field = sqrt(lattice_rdist2(i,j,k))
-       write(111,'(e12.5)') field
+       plane(i,j) = sqrt(lattice_rdist2(i,j,k))
        endif
     end do
     end do
+    write(111,'(e12.5)') plane
     end do
+    deallocate(plane)
     close(111)
     return
     end if
@@ -1179,6 +1335,55 @@ subroutine nitrogen_lattice_vis(option)
 end subroutine nitrogen_lattice_vis
 
 !==============================================================
+
+!==============================================================
+! Quicksort of arr(lo:hi) in ascending order, carrying brr, crr and drr along, with the
+! two halves of each partition sorted as OpenMP tasks. Ranges below cutoff use the serial
+! sort. Call from inside a parallel region's single construct.
+
+recursive subroutine parallel_sort(lo, hi, arr, brr, crr, drr)
+    implicit none
+    integer, intent(in)       :: lo, hi
+    real*8                    :: arr(*)
+    integer                   :: brr(*), crr(*), drr(*)
+    integer, parameter        :: cutoff = 100000
+    integer                   :: i, j, tempi
+    real*8                    :: pivot, temp
+
+    if(hi - lo < cutoff) then
+        if(hi > lo) call sort(hi-lo+1, arr(lo), brr(lo), crr(lo), drr(lo))
+        return
+    end if
+
+    ! Hoare partition around the median of the first, middle and last values
+    pivot = max(min(arr(lo), arr(hi)), min(max(arr(lo), arr(hi)), arr((lo+hi)/2)))
+    i = lo - 1
+    j = hi + 1
+    do
+        do
+            i = i + 1
+            if(arr(i) >= pivot) exit
+        end do
+        do
+            j = j - 1
+            if(arr(j) <= pivot) exit
+        end do
+        if(i >= j) exit
+        temp = arr(i);  arr(i) = arr(j);  arr(j) = temp
+        tempi = brr(i); brr(i) = brr(j); brr(j) = tempi
+        tempi = crr(i); crr(i) = crr(j); crr(j) = tempi
+        tempi = drr(i); drr(i) = drr(j); drr(j) = tempi
+    end do
+
+    !$omp task default(shared) firstprivate(lo, j)
+    call parallel_sort(lo, j, arr, brr, crr, drr)
+    !$omp end task
+    !$omp task default(shared) firstprivate(hi, j)
+    call parallel_sort(j+1, hi, arr, brr, crr, drr)
+    !$omp end task
+    !$omp taskwait
+
+end subroutine parallel_sort
 
 subroutine sort(n,arr,brr,crr,drr)
     integer n,m,nstack

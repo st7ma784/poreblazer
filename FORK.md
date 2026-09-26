@@ -16,7 +16,30 @@ This fork of [richardjgowers/poreblazer](https://github.com/richardjgowers/poreb
 - **`pore_distribution` runs in parallel.** The 10,000 sample sites are drawn first,
   in the original order, then sampled in parallel; the distribution is accumulated in
   sample order afterwards.
+- **Cell list in `lattice_calculations`.** Atoms are binned into cells about 2 A wide,
+  and each grid cubelet checks only the atoms in cells that can lie within the cutoff,
+  in ascending atom order, so the Lennard-Jones sum, the overlap test and the nearest
+  atom are exactly those found by checking every atom. A cubelet whose nearest atom or
+  nearest surface could lie beyond the cutoff (a pore wider than about twice the
+  cutoff) checks every atom, as upstream does. Orthorhombic cells only; other cells
+  check every atom.
+- **Parallel sort** of the cubelets by pore radius before the pore size distribution.
+  The order of equal radii can differ from the serial sort, which changes no result.
+- **Faster cluster relabelling** in the percolation analysis: a lookup table instead of
+  a search of every label so far for every site (quadratic in the number of clusters,
+  and overflowing after 100,000 clusters). The labels are unchanged.
+- **Faster `nitrogen_network.grd` output**: one write statement per plane instead of
+  one per cubelet, about 30% faster, same file.
 - The Makefile builds with `-fopenmp`. `OMP_NUM_THREADS` sets the number of threads.
+
+## Known upstream issue, not changed
+
+The percolation analysis's cluster labelling (`clusteranalysis`) records only one
+level of cluster merges, so it can split one connected cluster into several labels
+(on random 40^3 lattices, 54 of 60 were labelled differently from their true
+components, worst near the percolation threshold). This affects the percolating
+networks, the pore limiting diameter and the pore size distribution. The fork keeps
+upstream's labelling, so its results match upstream's.
 
 Results do not depend on the number of threads, and match upstream's serial build.
 Ambuild's profile of Poreblazer and the measurements behind these changes are in its
