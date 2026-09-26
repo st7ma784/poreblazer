@@ -60,6 +60,27 @@ This fork of [richardjgowers/poreblazer](https://github.com/richardjgowers/poreb
   the CPU) and `-fvect-cost-model=dynamic` (vectorises loops of unknown length; the
   operations are elementwise, so results are unchanged).
 
+## Testing and the published image
+
+`.github/workflows/ci.yml` runs on every push and pull request to `ambuild`:
+
+- `tests/test_percolation.f90` checks the exact labelling against an independent flood
+  fill on 200 random periodic lattices, and that Poreblazer's labelling still splits the
+  8-site counterexample as upstream does.
+- `tests/run_tests.py` builds upstream 3.0.5 (`a753c72`) beside the fork and runs both on
+  upstream's example frameworks (HKUST-1, IRMOF-1, MIL-47(V), and the hexagonal MOF-180)
+  and on three cells built by Ambuild (20 Å; 30 Å with 576 atoms; a near-empty 40 Å cell
+  whose pores are wider than the cutoff). With the default labelling the fork's log (less
+  the line naming the labelling) and every file it writes, `nitrogen_network.grd`
+  included, must match upstream's at 1 and 4 threads. With exact labelling the output must
+  match `tests/reference_exact.json` at both thread counts; for the three Ambuild cells
+  that reference also matches an independent build of the exact labelling.
+
+Once the tests pass on a push to `ambuild`, the workflow publishes the `Dockerfile` as
+`ghcr.io/st7ma784/poreblazer`, tagged `sha-<commit>` and `ambuild`. The executable is
+`/opt/poreblazer/poreblazer.exe` (it needs `libgfortran5` and `libgomp1`). Ambuild
+copies it from a pinned `sha-` tag.
+
 ## Opt-in exact cluster labelling
 
 The percolation analysis's cluster labelling (`clusteranalysis`) records only one

@@ -1,0 +1,79 @@
+# Build and test Ambuild's Poreblazer fork, then publish its image.
+#
+#   test   builds the fork and upstream 3.0.5 (a753c72) on Debian bookworm, runs the
+#          percolation unit tests, and checks that the fork's output matches upstream's
+#          exactly at 1 and 4 threads (and exact labelling its reference): tests/run_tests.py
+#   image  on pushes to the ambuild branch (or a manual run), once the tests pass: builds
+#          the Dockerfile and pushes ghcr.io/st7ma784/poreblazer, tagged sha-<commit> and
+#          ambuild. Ambuild pins a sha- tag.
+name: Build and test
+
+on:
+  push:
+    branches: [ambuild]
+  pull_request:
+    branches: [ambuild]
+  workflow_dispatch:
+
+env:
+  UPSTREAM_REPO: https://github.com/richardjgowers/poreblazer.git
+  UPSTREAM_COMMIT: a753c72bf255da58a48a8898170f3307dac6a325
+  IMAGE: ghcr.io/${{ github.repository_owner }}/poreblazer
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container: debian:bookworm
+    timeout-minutes: 45
+    steps:
+      - name: Install the compiler
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends gfortran make git python3 ca-certificates
+      - uses: actions/checkout@v4
+      - name: Build the fork
+        run: make -C src
+      - name: Build upstream 3.0.5 to compare with
+        run: |
+          git clone --quiet "$UPSTREAM_REPO" /tmp/upstream
+          git -C /tmp/upstream checkout --quiet "$UPSTREAM_COMMIT"
+          make -C /tmp/upstream/src
+      - name: Percolation unit tests
+        run: |
+          gfortran -O2 src/percolation.f90 tests/test_percolation.f90 -o /tmp/test_percolation
+          /tmp/test_percolation
+      - name: Compare with upstream
+        run: python3 tests/run_tests.py --fork src/poreblazer.exe --upstream /tmp/upstream/src/poreblazer.exe --threads 1 4
+
+  image:
+    needs: test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=sha,prefix=sha-,format=short
+            type=raw,value=ambuild
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+      - name: Check the published image runs
+        run: |
+          docker run --rm --entrypoint ls "$IMAGE:ambuild" -l /opt/poreblazer/poreblazer.exe
+          docker run --rm --entrypoint sh "$IMAGE:ambuild" -c 'ldd /opt/poreblazer/poreblazer.exe | grep -c "not found" | grep -q "^0$"'

@@ -10,6 +10,7 @@ Module percolation
 
     Private
     Public :: percolation_calc, percolation_calc_simple
+    Public :: clusteranalysis, clusteranalysis_exact     ! for tests/test_percolation.f90
 
     ! Cluster labelling: 0 is Poreblazer 3.0.5's (the default, so results match upstream),
     ! 1 is exact union-find. Poreblazer's labelling can split one connected cluster into
