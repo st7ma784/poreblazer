@@ -11,6 +11,11 @@ Module percolation
     Private
     Public :: percolation_calc, percolation_calc_simple
 
+    ! Cluster labelling: 0 is Poreblazer 3.0.5's (the default, so results match upstream),
+    ! 1 is exact union-find. Poreblazer's labelling can split one connected cluster into
+    ! several; see FORK.md.
+    Integer, Public :: percolation_labelling = 0
+
 
 Contains
 
@@ -36,7 +41,11 @@ Contains
         cl = 0
         trcl = 0
 
-        Call clusteranalysis(lattice_in,cluster,cl,trcl,nc)
+        If(percolation_labelling == 1) Then
+            Call clusteranalysis_exact(lattice_in,cluster,cl,nc)
+        Else
+            Call clusteranalysis(lattice_in,cluster,cl,trcl,nc)
+        End If
         Call span(lattice_in, n_sites, nn_sites, cluster, cl, nc, cl_summary)
         deallocate(cluster)
         deallocate(cl)
@@ -64,7 +73,11 @@ Contains
         trcl = 0
         spanning = 0
 
-        Call clusteranalysis(lattice_in,cluster,cl,trcl,nc)
+        If(percolation_labelling == 1) Then
+            Call clusteranalysis_exact(lattice_in,cluster,cl,nc)
+        Else
+            Call clusteranalysis(lattice_in,cluster,cl,trcl,nc)
+        End If
 
         Call span_simple(lattice_in, cluster, cl, nc, cl_summary, spanning)
         deallocate(cluster, cl, trcl)
@@ -166,6 +179,84 @@ Contains
 !     print*, "hello2"
      deallocate(newlabel)
      End Subroutine clusteranalysis
+
+!---------------------------------------------------------------------
+! Exact cluster labelling: union-find over the occupied sites with the same periodic
+! six-neighbour connectivity, clusters numbered in order of their first site in scan
+! order (the order clusteranalysis numbers them in). Two sites share a label exactly
+! when a path of occupied neighbours joins them.
+!---------------------------------------------------------------------
+
+    Subroutine clusteranalysis_exact(ngrid, cluster, cl, nc)
+        Integer*2, Dimension(:,:,:), Intent(In)   :: ngrid
+        Integer, Dimension(:,:,:), Intent(InOut)  :: cluster
+        Integer, Dimension(:), Intent(InOut)      :: cl
+        Integer, Intent(InOut)                    :: nc
+        Integer, Dimension(:), allocatable        :: parent
+        Integer                                   :: i, j, k, LX, LY, LZ, s, r
+
+        LX = size(ngrid,1)
+        LY = size(ngrid,2)
+        LZ = size(ngrid,3)
+        allocate(parent(LX*LY*LZ))
+        do s=1, LX*LY*LZ
+            parent(s) = s
+        end do
+        do k=1, LZ
+            do j=1, LY
+                do i=1, LX
+                    if(ngrid(i,j,k) /= 1) cycle
+                    s = i + LX*(j-1) + LX*LY*(k-1)
+                    if(ngrid(modulo(i,LX)+1,j,k) == 1) call unite(s, modulo(i,LX)+1 + LX*(j-1) + LX*LY*(k-1))
+                    if(ngrid(i,modulo(j,LY)+1,k) == 1) call unite(s, i + LX*modulo(j,LY) + LX*LY*(k-1))
+                    if(ngrid(i,j,modulo(k,LZ)+1) == 1) call unite(s, i + LX*(j-1) + LX*LY*modulo(k,LZ))
+                end do
+            end do
+        end do
+        ! Number the clusters in order of their first site; a numbered root holds -number
+        cluster = 0
+        nc = 0
+        do k=1, LZ
+            do j=1, LY
+                do i=1, LX
+                    if(ngrid(i,j,k) /= 1) cycle
+                    r = find(i + LX*(j-1) + LX*LY*(k-1))
+                    if(parent(r) > 0) then
+                        nc = nc + 1
+                        if(nc > size(cl)) stop "clusteranalysis_exact: more clusters than the cluster size array holds"
+                        parent(r) = -nc
+                    end if
+                    cluster(i,j,k) = -parent(r)
+                    cl(-parent(r)) = cl(-parent(r)) + 1
+                end do
+            end do
+        end do
+        deallocate(parent)
+
+    contains
+
+        ! The root of x, halving the path on the way (roots point to themselves, or hold
+        ! -number once numbered)
+        integer function find(x)
+            integer, intent(in) :: x
+            integer :: y
+            y = x
+            do while(parent(y) > 0 .and. parent(y) /= y)
+                if(parent(parent(y)) > 0) parent(y) = parent(parent(y))
+                y = parent(y)
+            end do
+            find = y
+        end function find
+
+        subroutine unite(a, b)
+            integer, intent(in) :: a, b
+            integer :: ra, rb
+            ra = find(a)
+            rb = find(b)
+            if(ra /= rb) parent(max(ra, rb)) = min(ra, rb)
+        end subroutine unite
+
+    End Subroutine clusteranalysis_exact
 
 !---------------------------------------------------------------------
 ! Subroutine which reveals status of the neighbouring sites

@@ -159,6 +159,7 @@ subroutine initialize(filename)
     use  vector, only:  vectype
     use random, only:   random_init
     use results
+    use percolation, only: percolation_labelling
 
     implicit none
     character(len=*), optional :: filename                                              ! input filename, defaults stdin
@@ -167,6 +168,8 @@ subroutine initialize(filename)
     character(256)                        :: filename1, filename2, filename3            ! data file names
     real*8                                :: sigma_he, eps_he, sigma_n                  ! sigma (A) and epsilon (K) of helium; sigma (A) of nitrogen atom
     type(vectype)                         ::  atvec1
+    character(256)                        :: visline                                    ! the visualisation line of defaults.dat
+    integer                               :: ios
 
     ! Initialization cycle
 
@@ -355,7 +358,18 @@ subroutine initialize(filename)
     call random_init(iseed)
 
 
-    read(3,*) vis_option
+    ! The visualisation option, optionally followed by the cluster labelling (fork only):
+    ! 0 (or absent) is Poreblazer 3.0.5's labelling, 1 is exact union-find labelling
+    read(3,'(a)') visline
+    read(visline,*) vis_option
+    read(visline,*,iostat=ios) vis_option, percolation_labelling
+    if(ios /= 0) percolation_labelling = 0
+    if(percolation_labelling == 1) then
+        write(*,*) "Percolation labelling: exact"
+    else
+        percolation_labelling = 0
+        write(*,*) "Percolation labelling: poreblazer"
+    end if
 
     close(1)
     close(2)

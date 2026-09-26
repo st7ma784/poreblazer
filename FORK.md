@@ -32,15 +32,23 @@ This fork of [richardjgowers/poreblazer](https://github.com/richardjgowers/poreb
   one per cubelet, about 30% faster, same file.
 - The Makefile builds with `-fopenmp`. `OMP_NUM_THREADS` sets the number of threads.
 
-## Known upstream issue, not changed
+## Opt-in exact cluster labelling
 
 The percolation analysis's cluster labelling (`clusteranalysis`) records only one
 level of cluster merges, so it can split one connected cluster into several labels
 (on random 40^3 lattices, 54 of 60 were labelled differently from their true
 components, worst near the percolation threshold). This affects the percolating
-networks, the pore limiting diameter and the pore size distribution. The fork keeps
-upstream's labelling, so its results match upstream's.
+networks, the pore limiting diameter and the pore size distribution, and makes
+spanning non-monotonic in probe radius, which misleads the limiting-diameter
+bisection. Ambuild's white paper and `benchmarks/percolation_study/` have the details.
 
-Results do not depend on the number of threads, and match upstream's serial build.
-Ambuild's profile of Poreblazer and the measurements behind these changes are in its
-`docs/benchmarks.md`.
+The fork keeps upstream's labelling by default, so its results match upstream's. To
+use exact union-find labelling instead, add `1` after the visualisation option (line 7
+of `defaults.dat`):
+
+```
+2, 1
+```
+
+The log states which labelling ran (`Percolation labelling: exact` or `poreblazer`).
+A `defaults.dat` without the second value behaves exactly as before.
