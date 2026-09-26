@@ -584,6 +584,8 @@ Contains
         Integer, Dimension(:,:), Intent(Out)      :: cl_summary
         Integer                                   :: x_span, y_span, z_span,potentialspan !x_span=0 if there is no spanning cluster
         Integer                                   :: n,i,j,k, LX, LY, LZ, ic, icount, spanning, i1
+        Integer, Dimension(:), allocatable        :: cand
+        Logical(kind=1), Dimension(:,:), allocatable :: xo, yo, zo
         Integer, Dimension(:), allocatable :: x_array, y_array, z_array
         Logical :: attempt
 
@@ -595,118 +597,26 @@ Contains
         ic = 0
         cl_summary = 0
 
-        ! Search for cluster sizes that are greater than LX/LY/LZ (any cluster smaller than this, won't be a spanning cluster)
+        ! Which planes each candidate cluster occupies, found in one pass over the grid
+        ! (upstream scanned the grid up to three times per candidate); the test per
+        ! candidate, in label order, is unchanged
+        Call plane_occupancy(cluster, cl, nc, cand, xo, yo, zo)
         do n=1, nc
-            x_span=1
-            y_span=1
-            z_span=1
-
-            x_array=0
-            y_array=0
-            z_array=0
-            potentialspan = 0
-
-            if (cl(n)>=LX.or.cl(n)>=LY.or.cl(n)>=LZ) then
-                !print*, " "
-                !print*, "Probing cluster ", n, " size ", cl(n)
-                attempt = .True.
-
-                potentialspan=n
-
-                ! When a cluster that is larger than LX is found, the cluster label matrix is investigated
-                ! Check z direction
-
-                do k=1, LZ
-                    do j=1, LY
-                        do i=1, LX
-                            if (cluster(i,j,k)==potentialspan) then
-                                z_array(k)=1
-                                ! If any position belongs to cluster in question, then exit looking at plane k and move on to next k
-                                go to 40
-                            end if
-                        end do
-                    end do
-
-        40      end do
-
-                do k=1, LZ
-                    if (z_array(k)==0) then
-                        z_span=0
-                        exit
-                    end if
-                end do
-
-
-                do j=1, LY
-
-                    ! Look at x-z plane
-                    do k=1, LZ
-                        do i=1, LX
-                            if (cluster(i,j,k)==potentialspan) then
-                                y_array(j)=1
-                                ! If any position belongs to cluster in question, then exit looking at plane j and move on to next j
-                                go to 60
-                            end if
-                        end do
-                    end do
-
-          60    end do
-
-                do j=1, LY
-                    if (y_array(j)==0) then
-                        y_span=0
-                        exit
-                    end if
-                end do
-
-                ! Repeat for x-direction
-
-                do i=1, LX
-
-                    ! Look at y-z plane
-                        do k=1, LZ
-                            do j=1, LY
-                                if (cluster(i,j,k)==potentialspan) then
-                                    x_array(i)=1
-                                    ! If any position belongs to cluster in question, then exit looking at plane i and move on to next i
-                                    go to 80
-                                end if
-                            end do
-                        end do
-
-          80    end do
-
-                do i=1, LX
-                    if (x_array(i)==0) then
-                        x_span=0
-                        exit
-                    end if
-                end do
-
-            ! If any of x, y or z_span =1, then cluster is percolated
-
-
-                spanning = 0
-                if(x_span==1) then
-                    spanning = spanning + 1
-                end if
-                if(y_span==1) then
-                    spanning = spanning + 1
-                end if
-
-                if(z_span==1) then
-                    spanning = spanning + 1
-                end if
-
-                if(spanning>0) then
-                    ic = ic + 1
-                    cl_summary(1, 1)      = ic
-                    cl_summary(ic+1, 1)   = potentialspan
-                    cl_summary(ic+1, 2)   = spanning
-                end if
+            if(cand(n) == 0) cycle
+            attempt = .True.
+            potentialspan = n
+            spanning = 0
+            if(all(xo(:, cand(n)))) spanning = spanning + 1
+            if(all(yo(:, cand(n)))) spanning = spanning + 1
+            if(all(zo(:, cand(n)))) spanning = spanning + 1
+            if(spanning>0) then
+                ic = ic + 1
+                cl_summary(1, 1)      = ic
+                cl_summary(ic+1, 1)   = potentialspan
+                cl_summary(ic+1, 2)   = spanning
             end if
-
         end do
+        deallocate(cand, xo, yo, zo)
 
         if(attempt.eqv..False.) then
             write(*,*) " The system is NOT percolated in ANY direction "
@@ -761,6 +671,8 @@ Contains
         Integer, Intent(InOut)                    :: spanning
         Integer                                   :: x_span, y_span, z_span,potentialspan !x_span=0 if there is no spanning cluster
         Integer                                   :: n,i,j,k, LX, LY, LZ, ic
+        Integer, Dimension(:), allocatable        :: cand
+        Logical(kind=1), Dimension(:,:), allocatable :: xo, yo, zo
         Integer, Dimension(:), allocatable  :: x_array, y_array, z_array
         Logical :: attempt
 
@@ -772,124 +684,28 @@ Contains
         ic = 0
         cl_summary = 0
 
-        ! Search for cluster sizes that are greater than LX/LY/LZ (any cluster smaller than this, won't be a spanning cluster)
+        ! Which planes each candidate cluster occupies, found in one pass over the grid
+        ! (upstream scanned the grid up to three times per candidate); the test per
+        ! candidate, in label order, is unchanged
+        Call plane_occupancy(cluster, cl, nc, cand, xo, yo, zo)
         do n=1, nc
-            x_span=1
-            y_span=1
-            z_span=1
-
-            x_array=0
-            y_array=0
-            z_array=0
-            potentialspan = 0
-
-            if (cl(n)>=LX.or.cl(n)>=LY.or.cl(n)>=LZ) then
-            !    print*, " "
-            !    print*, "Probing cluster ", n, " size ", cl(n)
-                attempt = .True.
-
-                potentialspan=n
-
-                ! When a cluster that is larger than LX is found, the cluster label matrix is investigated
-                ! Check z direction
-
-                do k=1, LZ
-
-                    !look at entire x-y plane
-                    do j=1, LY
-                        do i=1, LX
-                            if (cluster(i,j,k)==potentialspan) then
-                                z_array(k)=1
-                                ! If any position belongs to cluster in question, then exit looking at plane k and move on to next k
-                                go to 40
-                            end if
-                        end do
-                    end do
-
-            40  end do
-
-                do k=1, LZ
-                    if (z_array(k)==0) then
-                        z_span=0
-                        exit
-                    end if
-                end do
-
-
-                do j=1, LY
-
-                    ! Look at x-z plane
-                    do k=1, LZ
-                        do i=1, LX
-                            if (cluster(i,j,k)==potentialspan) then
-                                y_array(j)=1
-                                ! If any position belongs to cluster in question, then exit looking at plane j and move on to next j
-                                go to 60
-                            end if
-                        end do
-                    end do
-
-            60  end do
-
-                do j=1, LY
-                    if (y_array(j)==0) then
-                        y_span=0
-                        exit
-                    end if
-                end do
-
-                ! Repeat for x-direction
-
-                do i=1, LX
-
-                ! Look at y-z plane
-                    do k=1, LZ
-                        do j=1, LY
-                            if (cluster(i,j,k)==potentialspan) then
-                                x_array(i)=1
-                                ! If any position belongs to cluster in question, then exit looking at plane i and move on to next i
-                                go to 80
-                            end if
-                        end do
-                    end do
-
-            80  end do
-
-                do i=1, LX
-                    if (x_array(i)==0) then
-                        x_span=0
-                        exit
-                    end if
-                end do
-
-            ! If any of x, y or z_span =1, then cluster is percolated
-
-
-                spanning = 0
-                if(x_span==1) then
-                    spanning = spanning + 1
-                end if
-
-                if(y_span==1) then
-                    spanning = spanning + 1
-                end if
-
-                if(z_span==1) then
-                    spanning = spanning + 1
-                end if
-
-                if(spanning>0) then
-                    ic = ic + 1
-                    cl_summary(1, 1)      = ic
-                    cl_summary(ic+1, 1)   = potentialspan
-                    cl_summary(ic+1, 2)   = spanning
-
-                    deallocate(x_array, y_array, z_array)
-                    return
-                end if
+            if(cand(n) == 0) cycle
+            attempt = .True.
+            potentialspan = n
+            spanning = 0
+            if(all(xo(:, cand(n)))) spanning = spanning + 1
+            if(all(yo(:, cand(n)))) spanning = spanning + 1
+            if(all(zo(:, cand(n)))) spanning = spanning + 1
+            if(spanning>0) then
+                ic = ic + 1
+                cl_summary(1, 1)      = ic
+                cl_summary(ic+1, 1)   = potentialspan
+                cl_summary(ic+1, 2)   = spanning
+                deallocate(x_array, y_array, z_array, cand, xo, yo, zo)
+                return
             end if
-
         end do
+        deallocate(cand, xo, yo, zo)
 
         if(attempt.eqv..False.) then
         !    write(*,*) " The system is NOT percolated in ANY direction "
@@ -899,6 +715,52 @@ Contains
         deallocate(x_array, y_array, z_array)
 
     end subroutine span_simple
+
+!----------------------------------------------------------------------------
+! For each cluster big enough to span (at least LX, LY or LZ sites), cand(n) numbers it
+! and xo(i, cand(n)), yo(j, ...) and zo(k, ...) say whether it has a site in plane
+! i, j or k. One pass over the grid.
+!----------------------------------------------------------------------------
+
+    subroutine plane_occupancy(cluster, cl, nc, cand, xo, yo, zo)
+        Integer, Dimension(:,:,:), Intent(In)                  :: cluster
+        Integer, Dimension(:), Intent(In)                      :: cl
+        Integer, Intent(In)                                    :: nc
+        Integer, Dimension(:), allocatable, Intent(Out)        :: cand
+        Logical(kind=1), Dimension(:,:), allocatable, Intent(Out) :: xo, yo, zo
+        Integer                                                :: n, m, i, j, k, c, LX, LY, LZ
+
+        LX = size(cluster,1)
+        LY = size(cluster,2)
+        LZ = size(cluster,3)
+        allocate(cand(max(1, nc)))
+        cand = 0
+        m = 0
+        do n=1, nc
+            if(cl(n)>=LX.or.cl(n)>=LY.or.cl(n)>=LZ) then
+                m = m + 1
+                cand(n) = m
+            end if
+        end do
+        allocate(xo(LX, max(1, m)), yo(LY, max(1, m)), zo(LZ, max(1, m)))
+        xo = .False.
+        yo = .False.
+        zo = .False.
+        if(m == 0) return
+        do k=1, LZ
+            do j=1, LY
+                do i=1, LX
+                    c = cluster(i,j,k)
+                    if(c < 1 .or. c > nc) cycle
+                    c = cand(c)
+                    if(c == 0) cycle
+                    xo(i, c) = .True.
+                    yo(j, c) = .True.
+                    zo(k, c) = .True.
+                end do
+            end do
+        end do
+    end subroutine plane_occupancy
 
 
 !---------------------------------------------------------------------

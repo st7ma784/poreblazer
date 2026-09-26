@@ -30,7 +30,28 @@ This fork of [richardjgowers/poreblazer](https://github.com/richardjgowers/poreb
   and overflowing after 100,000 clusters). The labels are unchanged.
 - **Faster `nitrogen_network.grd` output**: one write statement per plane instead of
   one per cubelet, about 30% faster, same file.
-- The Makefile builds with `-fopenmp`. `OMP_NUM_THREADS` sets the number of threads.
+- **Pore size distribution search by blocks.** Each sample's answer is the largest
+  sphere (of a geometrically accessible cubelet) containing its point. Upstream found it
+  by scanning every cubelet from the largest radius down. The fork groups cubelets into
+  blocks, visits the blocks from the largest radius they hold down, stops when no block
+  left can beat the best sphere found, and skips blocks farther from the point than their
+  largest radius. It uses upstream's containment test, so it finds the same sphere.
+- **Spanning test in one pass.** The percolation analysis finds the planes every
+  candidate cluster occupies in one pass over the grid, instead of up to three passes
+  per candidate. The per-cluster test and its order are unchanged.
+- **Surface area in parallel, with a cell list.** Every trial draws its two random
+  numbers before any test, so the numbers are drawn first, in upstream's order. The
+  atoms then run in parallel, and their areas are summed in atom order. The overlap
+  test checks only atoms in nearby cells (orthorhombic cells).
+- **Vectorised distances in the lattice step.** Distances to the candidate atoms are
+  computed in a loop of their own over contiguous arrays, with the arithmetic of
+  `fundcell_snglMinImage`. `anint` is written in a form the compiler vectorises: it
+  truncates |q|, adds 1 when the part dropped is at least 1/2, and restores the sign,
+  which is exact for these arguments.
+- The Makefile builds with `-fopenmp`, and `OMP_NUM_THREADS` sets the number of threads.
+  It also uses `-ffp-contract=off` (no fused multiply-adds, so results do not depend on
+  the CPU) and `-fvect-cost-model=dynamic` (vectorises loops of unknown length; the
+  operations are elementwise, so results are unchanged).
 
 ## Opt-in exact cluster labelling
 

@@ -64,6 +64,97 @@ module results
         integer :: sys_perc
 end module results
 
+module atomcells
+        ! Atoms binned into cells, for searches that need only nearby atoms. Used for
+        ! orthorhombic cells only: there the minimum image is taken component by component,
+        ! so the gap between two cells bounds the distance between any points in them.
+        ! Otherwise a single cell holds every atom.
+        implicit none
+        integer                  :: ncell(3) = 1, ncells = 1                          ! cells along each side, in total
+        real*8                   :: cellw(3) = 0.0d0                                  ! cell widths (A)
+        integer, allocatable     :: cell_start(:), cell_atoms(:)                      ! atoms of cell n: cell_atoms(cell_start(n):cell_start(n+1)-1), ascending
+
+contains
+
+    ! Bin the atoms (matvec) into cells about target A wide, or into one cell
+    subroutine atomcells_build(target, use_cells)
+        use parameters, only: fcell
+        use adsorbent, only:  natoms, matvec
+        real*8, intent(in)       :: target
+        logical, intent(in)      :: use_cells
+        integer                  :: i, d, n, c(3)
+        integer, allocatable     :: atom_cell(:), fill(:)
+
+        if(allocated(cell_start)) deallocate(cell_start, cell_atoms)
+        ncell = 1
+        cellw = fcell%ell
+        if(use_cells) then
+            do d=1, 3
+                ncell(d) = max(1, int(fcell%ell(d)/target))
+                cellw(d) = fcell%ell(d)/dble(ncell(d))
+            end do
+        end if
+        ncells = ncell(1)*ncell(2)*ncell(3)
+        allocate(atom_cell(natoms), fill(ncells), cell_start(ncells+1), cell_atoms(natoms))
+        cell_start = 0
+        do i=1, natoms
+            do d=1, 3
+                c(d) = atomcells_index(matvec(i)%comp(d), d)
+            end do
+            atom_cell(i) = 1 + c(1) + ncell(1)*(c(2) + ncell(2)*c(3))
+            cell_start(atom_cell(i)+1) = cell_start(atom_cell(i)+1) + 1
+        end do
+        cell_start(1) = 1
+        do n=1, ncells
+            cell_start(n+1) = cell_start(n+1) + cell_start(n)
+        end do
+        fill = cell_start(1:ncells)
+        do i=1, natoms
+            cell_atoms(fill(atom_cell(i))) = i
+            fill(atom_cell(i)) = fill(atom_cell(i)) + 1
+        end do
+        deallocate(atom_cell, fill)
+    end subroutine atomcells_build
+
+    ! The cell (from 0) along side d of coordinate x, wrapped into the cell
+    integer function atomcells_index(x, d)
+        use parameters, only: fcell
+        real*8, intent(in)       :: x
+        integer, intent(in)      :: d
+        real*8                   :: s
+        s = x - fcell%ell(d)*floor(x/fcell%ell(d))
+        atomcells_index = max(0, min(int(s/cellw(d)), ncell(d)-1))
+    end function atomcells_index
+
+    ! The cells along side d that can lie within reach of a point in cell a, each once
+    ! (periodic), with the smallest gap between a point in cell a and one in each
+    subroutine atomcells_neighbours(a, d, reach, nb, gap, n)
+        integer, intent(in)      :: a, d
+        real*8, intent(in)       :: reach
+        integer, intent(out)     :: nb(:), n
+        real*8, intent(out)      :: gap(:)
+        integer                  :: m, b, o
+        n = 0
+        m = int(reach/cellw(d)) + 1
+        if(2*m+1 >= ncell(d)) then
+            do b=0, ncell(d)-1
+                o = abs(b - a)
+                o = min(o, ncell(d) - o)
+                n = n + 1
+                nb(n) = b
+                gap(n) = max(0, o-1)*cellw(d)
+            end do
+        else
+            do o=-m, m
+                n = n + 1
+                nb(n) = modulo(a + o, ncell(d))
+                gap(n) = max(0, abs(o)-1)*cellw(d)
+            end do
+        end if
+    end subroutine atomcells_neighbours
+
+end module atomcells
+
 program poreblazer
 implicit none
 interface initialize
@@ -426,8 +517,8 @@ subroutine lattice_calculations
     use atoms
     use adsorbent
     use lattice
+    use atomcells
 
-    use defaults, only:     rdbl
     use fundcell, only:     fundamental_cell, fundcell_snglminimage, fundcell_isortho
     use vector, only:       vectype
 
@@ -435,13 +526,14 @@ subroutine lattice_calculations
 
     real*8, parameter                  :: cell_target = 2.0d0       ! width of the cell-list cells (A)
     real*8, parameter                  :: margin = 1.0d-3           ! cells are searched to hicut + margin (A)
-    real*8                             :: maxsigma, reach, s, x, cellw(3)
-    integer*4                          :: i, j, k, l, icount, a, b, d, n, o, ix, iy, iz, ncand, ncells, maxnb
-    integer                            :: c(3), ncell(3), ncubes(3), nnb(3), m(3)
-    logical                            :: exact
-    integer, allocatable               :: atom_cell(:), cell_start(:), fill(:), cell_atoms(:), all_atoms(:)
-    integer, allocatable               :: pfirst(:,:), plast(:,:), nbr(:,:), cand(:)
-    real*8, allocatable                :: gap(:,:)
+    real*8                             :: maxsigma, reach, x, xl, yl, zl
+    integer*4                          :: i, j, k, l, icount, a, b, d, n, ix, iy, iz, ncand, maxnb
+    integer                            :: c(3), ncubes(3), nnb(3)
+    logical                            :: exact, ortho
+    integer, allocatable               :: all_atoms(:), pfirst(:,:), plast(:,:), nbr(:,:), cand(:)
+    real*8, allocatable                :: gap(:,:), d2(:)
+    real*8, allocatable                :: ax(:), ay(:), az(:), aov(:), ahalf(:), as2he(:), alj(:)
+    real*8, allocatable                :: cx(:), cy(:), cz(:), cov(:), chalf(:), cs2he(:), ceps(:)
     logical, allocatable               :: mark(:)
 
 
@@ -463,42 +555,33 @@ subroutine lattice_calculations
     ! and the nearest atom are exactly those found by checking every atom. When the nearest
     ! atom or the nearest surface could lie beyond the cutoff (a pore wider than about twice
     ! the cutoff), the cubelet checks every atom instead, as upstream does. The list is used
-    ! for orthorhombic cells only, where the minimum image is taken component by component;
-    ! other cells use a single cell, i.e. every atom.
+    ! for orthorhombic cells only (module atomcells); other cells use a single cell.
+    !
+    ! The distances are computed in a loop of their own over contiguous copies of the
+    ! positions, with the arithmetic of fundcell_snglMinImage, so the compiler can keep it
+    ! tight; the loop that uses them runs in atom order as before.
     maxsigma = maxval(asigma)
     reach = hicut + margin
-    ncell = 1
-    cellw = fcell%ell
-    if(fundcell_isortho(fcell) .and. 0.5*maxsigma < hicut) then
-        do d=1, 3
-            ncell(d) = max(1, int(fcell%ell(d)/cell_target))
-            cellw(d) = fcell%ell(d)/dble(ncell(d))
-        end do
-    end if
-    ncells = ncell(1)*ncell(2)*ncell(3)
+    ortho = fundcell_isortho(fcell)
+    call atomcells_build(cell_target, ortho .and. 0.5*maxsigma < hicut)
     ncubes = (/ ncubesx, ncubesy, ncubesz /)
     maxnb = maxval(ncell)
+    xl = fcell%ell(1)
+    yl = fcell%ell(2)
+    zl = fcell%ell(3)
 
-    ! Atoms of each cell, in ascending atom order
-    allocate(atom_cell(natoms), cell_start(ncells+1), fill(ncells), cell_atoms(natoms), all_atoms(natoms))
-    cell_start = 0
+    ! Contiguous copies of the positions and of the type parameters the cubelet loop uses
+    allocate(all_atoms(natoms), ax(natoms), ay(natoms), az(natoms), aov(natoms), ahalf(natoms), &
+             as2he(natoms), alj(natoms))
     do i=1, natoms
         all_atoms(i) = i
-        do d=1, 3
-            s = matvec(i)%comp(d) - fcell%ell(d)*floor(matvec(i)%comp(d)/fcell%ell(d))
-            c(d) = max(0, min(int(s/cellw(d)), ncell(d)-1))
-        end do
-        atom_cell(i) = 1 + c(1) + ncell(1)*(c(2) + ncell(2)*c(3))
-        cell_start(atom_cell(i)+1) = cell_start(atom_cell(i)+1) + 1
-    end do
-    cell_start(1) = 1
-    do n=1, ncells
-        cell_start(n+1) = cell_start(n+1) + cell_start(n)
-    end do
-    fill = cell_start(1:ncells)
-    do i=1, natoms
-        cell_atoms(fill(atom_cell(i))) = i
-        fill(atom_cell(i)) = fill(atom_cell(i)) + 1
+        ax(i) = matvec(i)%comp(1)
+        ay(i) = matvec(i)%comp(2)
+        az(i) = matvec(i)%comp(3)
+        aov(i) = 0.25*asigma2(atype(i))
+        ahalf(i) = 0.5*asigma(atype(i))
+        as2he(i) = asigma2_he(atype(i))
+        alj(i) = aeps_he(atype(i))
     end do
 
     ! Range of cubelets in each cell along each side
@@ -514,35 +597,18 @@ subroutine lattice_calculations
         end do
     end do
 
-    !$omp parallel default(shared) private(a, b, c, d, n, o, ix, iy, iz, j, k, l, ncand, nnb, m, exact, &
-    !$omp nbr, gap, mark, cand)
-    allocate(nbr(maxnb, 3), gap(maxnb, 3), mark(natoms), cand(natoms))
+    !$omp parallel default(shared) private(a, b, c, d, n, ix, iy, iz, j, k, l, ncand, nnb, exact, &
+    !$omp nbr, gap, mark, cand, cx, cy, cz, cov, chalf, cs2he, ceps, d2)
+    allocate(nbr(maxnb, 3), gap(maxnb, 3), mark(natoms), cand(natoms), d2(natoms), &
+             cx(natoms), cy(natoms), cz(natoms), cov(natoms), chalf(natoms), cs2he(natoms), ceps(natoms))
     mark = .False.
     !$omp do collapse(3) schedule(dynamic)
     do iz=0, ncell(3)-1
         do iy=0, ncell(2)-1
             do ix=0, ncell(1)-1
-                ! Neighbouring cells along each side, with the smallest gap between a point in
-                ! this cell and a point in the neighbour (periodic, each cell once)
                 c = (/ ix, iy, iz /)
                 do d=1, 3
-                    nnb(d) = 0
-                    m(d) = int(reach/cellw(d)) + 1
-                    if(2*m(d)+1 >= ncell(d)) then
-                        do b=0, ncell(d)-1
-                            o = abs(b - c(d))
-                            o = min(o, ncell(d) - o)
-                            nnb(d) = nnb(d) + 1
-                            nbr(nnb(d), d) = b
-                            gap(nnb(d), d) = max(0, o-1)*cellw(d)
-                        end do
-                    else
-                        do o=-m(d), m(d)
-                            nnb(d) = nnb(d) + 1
-                            nbr(nnb(d), d) = modulo(c(d) + o, ncell(d))
-                            gap(nnb(d), d) = max(0, abs(o)-1)*cellw(d)
-                        end do
-                    end if
+                    call atomcells_neighbours(c(d), d, reach, nbr(:,d), gap(:,d), nnb(d))
                 end do
 
                 ! Candidate atoms: those in cells closer than the cutoff, in ascending order
@@ -562,6 +628,13 @@ subroutine lattice_calculations
                     if(mark(n)) then
                         ncand = ncand + 1
                         cand(ncand) = n
+                        cx(ncand) = ax(n)
+                        cy(ncand) = ay(n)
+                        cz(ncand) = az(n)
+                        cov(ncand) = aov(n)
+                        chalf(ncand) = ahalf(n)
+                        cs2he(ncand) = as2he(n)
+                        ceps(ncand) = alj(n)
                         mark(n) = .False.
                     end if
                 end do
@@ -569,8 +642,9 @@ subroutine lattice_calculations
                 do l=pfirst(iz,3), plast(iz,3)
                     do k=pfirst(iy,2), plast(iy,2)
                         do j=pfirst(ix,1), plast(ix,1)
-                            call lattice_cube(j, k, l, cand, ncand, exact)
-                            if(.not. exact) call lattice_cube(j, k, l, all_atoms, natoms, exact)
+                            call lattice_cube(j, k, l, ncand, cand, cx, cy, cz, cov, chalf, cs2he, ceps, d2, exact)
+                            if(.not. exact) call lattice_cube(j, k, l, natoms, all_atoms, ax, ay, az, aov, ahalf, &
+                                                              as2he, alj, d2, exact)
                         end do
                     end do
                 end do
@@ -578,9 +652,9 @@ subroutine lattice_calculations
         end do
     end do
     !$omp end do
-    deallocate(nbr, gap, mark, cand)
+    deallocate(nbr, gap, mark, cand, d2, cx, cy, cz, cov, chalf, cs2he, ceps)
     !$omp end parallel
-    deallocate(atom_cell, cell_start, fill, cell_atoms, all_atoms, pfirst, plast)
+    deallocate(all_atoms, ax, ay, az, aov, ahalf, as2he, alj, pfirst, plast)
 
     ! Lists of geometrically, helium- and nitrogen-accessible cubelets, in cubelet order
     do l=1, ncubesz
@@ -613,24 +687,60 @@ subroutine lattice_calculations
 
 contains
 
-    ! One cubelet, checking the atoms in list(1:nlist) (in ascending order). exact is false,
-    ! and nothing is stored, when an atom outside the list could still be the nearest atom
-    ! or give the nearest surface; the list always holds every atom within the cutoff, so
-    ! the overlap test and the Lennard-Jones sum are exact either way.
-    subroutine lattice_cube(j, k, l, list, nlist, exact)
+    ! One cubelet, checking the atoms list(1:nlist) (ascending), whose positions and type
+    ! parameters are x, y, z, ov, half, s2he and eps(1:nlist); d2 is workspace. exact is
+    ! false, and nothing is stored, when an atom outside the list could still be the
+    ! nearest atom or give the nearest surface; the list always holds every atom within
+    ! the cutoff, so the overlap test and the Lennard-Jones sum are exact either way.
+    subroutine lattice_cube(j, k, l, nlist, list, x, y, z, ov, half, s2he, eps, d2, exact)
         integer, intent(in)                :: j, k, l, nlist
-        integer, intent(in)                :: list(:)
+        integer, intent(in)                :: list(nlist)
+        real*8, intent(in)                 :: x(nlist), y(nlist), z(nlist), ov(nlist), half(nlist), s2he(nlist), eps(nlist)
+        real*8, intent(inout)              :: d2(nlist)
         logical, intent(out)               :: exact
         type(vectype)                      :: atvec1, sepvec
+        real*8                             :: px, py, pz, d1, dd2, d3, q1, q2, q3, r1, r2, r3
         real*8                             :: rdist2, rdist6, rdist12, rdist2_ref, rdist_surface, rdist_surface_ref
         real*8                             :: sig2_rdist2, lj_energy, lj_sum
-        integer                            :: i, n, icount, amin
+        integer                            :: n, icount, amin
         logical                            :: overlap
 
         icount = ((l-1) * ncubesx * ncubesy) + ((k-1) * ncubesx) + j                                ! count cubelets
 
         ! calculate the coordinates of the center of each cubelet
         atvec1%comp = (/dble(j-1), dble(k-1), dble(l-1)/) * cube_size + (0.5 * cube_size)
+
+        ! squared minimum-image distances, as fundcell_snglMinImage computes them
+        if(ortho) then
+            px = atvec1%comp(1)
+            py = atvec1%comp(2)
+            pz = atvec1%comp(3)
+            ! anint(q), written so that it vectorises: truncate |q|, add 1 when the part
+            ! dropped is at least 1/2, restore the sign. Exact for |q| < 2**31 (separations
+            ! are within a few cell lengths), so the distances are unchanged.
+            do n=1, nlist
+                d1 = px - x(n)
+                dd2 = py - y(n)
+                d3 = pz - z(n)
+                q1 = d1/xl
+                q2 = dd2/yl
+                q3 = d3/zl
+                r1 = dble(int(abs(q1)))
+                r2 = dble(int(abs(q2)))
+                r3 = dble(int(abs(q3)))
+                r1 = r1 + merge(1.0d0, 0.0d0, abs(q1) - r1 >= 0.5d0)
+                r2 = r2 + merge(1.0d0, 0.0d0, abs(q2) - r2 >= 0.5d0)
+                r3 = r3 + merge(1.0d0, 0.0d0, abs(q3) - r3 >= 0.5d0)
+                d1 = d1 - xl*(sign(r1, q1))
+                dd2 = dd2 - yl*(sign(r2, q2))
+                d3 = d3 - zl*(sign(r3, q3))
+                d2(n) = d1*d1+dd2*dd2+d3*d3
+            end do
+        else
+            do n=1, nlist
+                call fundcell_snglMinImage(fcell,atvec1,matvec(list(n)),sepvec,d2(n))
+            end do
+        end if
 
         overlap = .False.
 
@@ -640,32 +750,30 @@ contains
         lj_sum = 0.0d0
 
         do n=1, nlist                                      ! for each cubelet go through the atoms of the adsorbent structure
-            i = list(n)
-
-            call fundcell_snglMinImage(fcell,atvec1,matvec(i),sepvec,rdist2)     ! calculate the distance between each atom and center of cubelet icount
+            rdist2 = d2(n)
 
             ! First check if the point is "inside" a sphere
-            if(rdist2<0.25*asigma2(atype(i))) then             ! ignore the cubelet icount if it is "inside" an atom
+            if(rdist2<ov(n)) then                              ! ignore the cubelet icount if it is "inside" an atom
                 overlap=.True.
                 exit
             end if
 
             if(rdist2<rdist2_ref) then                         ! in the next few lines we identify if the returned distance squared rdist2 is the smallest so far between
                 rdist2_ref = rdist2                            ! cubelet icount and an atom of the structure, without an overlap
-                amin = i
+                amin = list(n)
             end if
 
-            rdist_surface = sqrt(rdist2)- 0.5*asigma(atype(i))
+            rdist_surface = sqrt(rdist2)- half(n)
 
             if(rdist_surface<rdist_surface_ref) then
                 rdist_surface_ref = rdist_surface
             end if
 
-            if(rdist2<hicut2) then                            ! ignore the atom i if it is beyond the cutoff radius
-                sig2_rdist2 = asigma2_he(atype(i))/rdist2         ! if an atom is within the cut-off, this is a convinient place to calculate its Lennard-Jones interaction
+            if(rdist2<hicut2) then                            ! ignore the atom if it is beyond the cutoff radius
+                sig2_rdist2 = s2he(n)/rdist2                      ! if an atom is within the cut-off, this is a convinient place to calculate its Lennard-Jones interaction
                 rdist6 = sig2_rdist2*sig2_rdist2*sig2_rdist2                         ! with a helium atom placed in the center of the cubelet icount for later use in the helium volume calculation
                 rdist12 = rdist6*rdist6                           ! based in the second virial approach
-                lj_energy  = aeps_he(atype(i))*(rdist12-rdist6)
+                lj_energy  = eps(n)*(rdist12-rdist6)
                 lj_sum = lj_sum + lj_energy
             end if
         end do
@@ -847,7 +955,9 @@ subroutine surface_area
     use lattice
 
     use defaults, only:   rdbl, pi
-    use fundcell, only:   fundamental_cell, fundcell_snglminimage, fundcell_getvolume, fundcell_maptocell, fundcell_slant
+    use fundcell, only:   fundamental_cell, fundcell_snglminimage, fundcell_getvolume, fundcell_maptocell, fundcell_slant, &
+                          fundcell_isortho
+    use atomcells
     use vector, only:     vectype
     Use random, only:     rranf
     use results
@@ -859,6 +969,12 @@ subroutine surface_area
     integer                               :: nx, ny, nz, ncount, i, j, k, nx_temp, ny_temp, nz_temp
     type(VecType)                         :: atvec1, atvec2, sepvec, atvec_temp
     logical                               :: deny
+    integer, parameter                    :: block = 256        ! atoms whose random numbers are drawn at a time
+    real*8                                :: reach, xl, yl, zl, d1, d2, d3
+    integer                               :: i0, i1, ii, m, n1, n2, n3, b, maxnb, c(3), nnb(3)
+    logical                               :: ortho
+    real*8, allocatable                   :: rnd(:,:,:), ax(:), ay(:), az(:), gap(:,:)
+    integer, allocatable                  :: counts(:), nbr(:,:)
 
     write(*,*) "!-------------------------------------------------------!"
     write(*,*) "! Starting surface area calculations                    !"
@@ -876,92 +992,135 @@ subroutine surface_area
 
     stotal = 0.0      ! initialize cumulative accessible surface area
 
-    do i=1, natoms    ! number of atoms in the structure
+    ! The trial points are the same as upstream's: every trial draws its two random numbers
+    ! before any test, so the numbers for a block of atoms are drawn first, in upstream's
+    ! order, and the atoms then run in parallel. The surface area is summed in atom order.
+    ! The overlap test checks only atoms in nearby cells (module atomcells; orthorhombic
+    ! cells only), as no farther atom can overlap the point.
+    ortho = fundcell_isortho(fcell)
+    reach = sqrt(coeff_surface2*maxval(asigma2_n)) + 1.0d-3
+    call atomcells_build(reach, ortho)
+    maxnb = maxval(ncell)
+    xl = fcell%ell(1)
+    yl = fcell%ell(2)
+    zl = fcell%ell(3)
+    allocate(rnd(2, nsample, block), counts(block), ax(natoms), ay(natoms), az(natoms))
+    do k=1, natoms
+        ax(k) = matvec(k)%comp(1)
+        ay(k) = matvec(k)%comp(2)
+        az(k) = matvec(k)%comp(3)
+    end do
 
+    do i0=1, natoms, block
+    i1 = min(natoms, i0 + block - 1)
+    do i=i0, i1
+        do j=1, nsample
+            rnd(1, j, i-i0+1) = rranf()
+            rnd(2, j, i-i0+1) = rranf()
+        end do
+    end do
+
+    !$omp parallel default(shared) private(i, ii, j, k, m, n1, n2, n3, b, c, nnb, nbr, gap, ncount, phi, &
+    !$omp costheta, theta, atvec1, atvec_temp, sepvec, nx, ny, nz, rdist2, deny, d1, d2, d3)
+    allocate(nbr(maxnb, 3), gap(maxnb, 3))
+    !$omp do schedule(dynamic)
+    do i=i0, i1    ! atoms of the structure
+        ii = i - i0 + 1
         ncount = 0
-
         do j=1, nsample   ! number of sample points for each atom
-
             ! generate random vector of length 1
             ! first generate phi -pi pi
-
-            phi=pi - rranf()*2.0*pi
-
+            phi=pi - rnd(1, j, ii)*2.0*pi
             ! generate theta -pi:pi
-            costheta = 1 - rranf() * 2.0
+            costheta = 1 - rnd(2, j, ii) * 2.0
             theta = acos(costheta)
             atvec1%comp(1) = sin(theta) * cos(phi)
             atvec1%comp(2) = sin(theta) * sin(phi)
             atvec1%comp(3) = costheta
-
             ! make this vector of (sigma+probe_diameter)/2.0 length
-
             atvec1%comp = atvec1%comp * (coeff_surface * asigma_n(atype(i))) +  coords(:,i)
-
             ! translate the center of the coordinate to the particle i center and apply PBC
-
             ! apply PBCs to ensure that the selected point is within the simulation cell
-
             atvec_temp = atvec1
-            
             if(fcell%orthoflag.eqv..True.) then
             atvec1 = fundcell_maptocell(fcell,atvec1)
             else
             atvec1 = fundcell_slant(fcell, atvec1)
-!            atvec1%comp(1) =  atvec1%comp(1) - fcell%mx
-!            atvec1%comp(2) =  atvec1%comp(2) - fcell%my
-!            atvec1%comp(3) =  atvec1%comp(3) - fcell%mz
             end if
-
             ! locate the cubelet in which the point sits
-
             nx = int(atvec1%comp(1)/cube_size) + 1
             ny = int(atvec1%comp(2)/cube_size) + 1
             nz = int(atvec1%comp(3)/cube_size) + 1
-            
             if(nx>ncubesx) nx = nx - (nx/ncubesx)*ncubesx
             if(nx<1) nx = nx + (1-(nx/ncubesx))*ncubesx
             if(ny>ncubesy) ny = ny - (ny/ncubesy)*ncubesy
             if(ny<1) ny = ny +  (1-(ny/ncubesy))*ncubesy
             if(nz>ncubesz) nz = nz - (nz/ncubesz)*ncubesz
             if(nz<1) nz = nz +  (1-(nz/ncubesz))*ncubesz
-
             if(lattice_space_n(nx,ny,nz)<1) cycle ! reject the point if it is within an atom
-
             !----------------------
             ! now we perform the overlap test, i.e. we ensure that the selected point is not inside
             ! any other surf_coeff*(atom_diamter+probe_diameter)/2 distance in the system
-
             deny=.False.
-
-            do k=1, natoms
-                if(k==i) cycle
-
-                !atvec2%comp = coords(:, k)
-
-                Call fundcell_snglMinImage(fcell,atvec1,matvec(k),sepvec,rdist2)
-                if(rdist2<coeff_surface2*asigma2_n(atype(k))) then
-                    deny=.True.
-                    exit
-                end if
-            end do
+            if(ortho) then
+                do m=1, 3
+                    c(m) = atomcells_index(atvec1%comp(m), m)
+                    call atomcells_neighbours(c(m), m, reach, nbr(:,m), gap(:,m), nnb(m))
+                end do
+                do n3=1, nnb(3)
+                    do n2=1, nnb(2)
+                        do n1=1, nnb(1)
+                            if(gap(n1,1)**2 + gap(n2,2)**2 + gap(n3,3)**2 >= reach*reach) cycle
+                            b = 1 + nbr(n1,1) + ncell(1)*(nbr(n2,2) + ncell(2)*nbr(n3,3))
+                            do m=cell_start(b), cell_start(b+1)-1
+                                k = cell_atoms(m)
+                                if(k==i) cycle
+                                ! as fundcell_snglMinImage computes it
+                                d1 = atvec1%comp(1) - ax(k)
+                                d2 = atvec1%comp(2) - ay(k)
+                                d3 = atvec1%comp(3) - az(k)
+                                d1 = d1 - xl*(anint(d1/xl))
+                                d2 = d2 - yl*(anint(d2/yl))
+                                d3 = d3 - zl*(anint(d3/zl))
+                                rdist2 = d1*d1+d2*d2+d3*d3
+                                if(rdist2<coeff_surface2*asigma2_n(atype(k))) then
+                                    deny=.True.
+                                    go to 100
+                                end if
+                            end do
+                        end do
+                    end do
+                end do
+100             continue
+            else
+                do k=1, natoms
+                    if(k==i) cycle
+                    Call fundcell_snglMinImage(fcell,atvec1,matvec(k),sepvec,rdist2)
+                    if(rdist2<coeff_surface2*asigma2_n(atype(k))) then
+                        deny=.True.
+                        exit
+                    end if
+                end do
+            end if
             !----------------------
-
-
             if(deny) cycle
-!            write(50,*) "Ar ", atvec_temp%comp(1), atvec_temp%comp(2), atvec_temp%comp(3)
             ncount=ncount+1
         end do
+        counts(ii) = ncount
+    end do
+    !$omp end do
+    deallocate(nbr, gap)
+    !$omp end parallel
 
+    do i=i0, i1
         ! fraction of the accessible surface area for sphere i
-        sfrac=dble(ncount)/dble(nsample)
-
-
+        sfrac=dble(counts(i-i0+1))/dble(nsample)
         ! surface area for sphere i in real units (A^2)
         sjreal=4.0*pi*coeff_surface2*asigma2_n(atype(i))*sfrac
         stotal=stotal+sjreal
-
     end do
+    end do
+    deallocate(rnd, counts, ax, ay, az)
 
     ! converting stotal on Surface per Volume
 
@@ -999,7 +1158,7 @@ subroutine pore_distribution
     use distributions
 
 
-    use fundcell, only: fundcell_init, fundamental_cell, fundcell_snglminimage, fundcell_slant
+    use fundcell, only: fundcell_init, fundamental_cell, fundcell_snglminimage, fundcell_slant, fundcell_isortho
     Use vector, only: vectype
     Use random, Only: rranf
 
@@ -1011,6 +1170,11 @@ subroutine pore_distribution
     real*8                                :: deldis1, deldis2, deldis
     integer, parameter                    :: nsamples = 10000
     integer, allocatable                  :: sites(:), bins(:)
+    real*8                                :: rmax2, best, v, t, g2, xq(3), lo, hi
+    integer                               :: bsz, nb(3), nblocks, n, d, bx, by, bz, j1, k1, l1
+    logical                               :: ortho
+    real*8, allocatable                   :: blockmax(:,:,:), bkey(:)
+    integer, allocatable                  :: bxs(:), bys(:), bzs(:)
 
 
     write(*,*) "!-------------------------------------------------------!"
@@ -1063,16 +1227,53 @@ subroutine pore_distribution
         sites(i) = isite
     end do
 
-    !$omp parallel do default(shared) schedule(dynamic, 16) &
-    !$omp private(i, j, isite, nx, ny, nz, nx1, ny1, nz1, atvec1, atvec2, sepvec, rdist2, &
-    !$omp sigma2_ref, sigma_ref, bin)
+    ! Each sample takes the largest sphere, among the geometrically accessible cubelets,
+    ! that contains its point: upstream scans the cubelets from the largest radius down and
+    ! stops at the first that contains it, which is that maximum. Here the cubelets are
+    ! grouped in blocks of bsz^3, and the blocks are visited from the largest radius they
+    ! hold down, stopping at the first block that cannot beat the best sphere so far. In
+    ! orthorhombic cells a block farther from the point than its largest radius is skipped.
+    ! The containment test is upstream's, so the same sphere radius is found.
+    ortho = fundcell_isortho(fcell)
+    rmax2 = PA1(ng_cubes)
+    bsz = max(8, int(sqrt(rmax2)/(6.0d0*cube_size)) + 1)
+    nb = (/ (ncubesx+bsz-1)/bsz, (ncubesy+bsz-1)/bsz, (ncubesz+bsz-1)/bsz /)
+    allocate(blockmax(0:nb(1)-1, 0:nb(2)-1, 0:nb(3)-1))
+    blockmax = -1.0d0
+    do l=1, ncubesz
+        do k=1, ncubesy
+            do j=1, ncubesx
+                if(lattice_space(j,k,l)<1) cycle
+                blockmax((j-1)/bsz, (k-1)/bsz, (l-1)/bsz) = max(blockmax((j-1)/bsz, (k-1)/bsz, (l-1)/bsz), &
+                                                               lattice_rdist2(j,k,l))
+            end do
+        end do
+    end do
+    ! The blocks, sorted by the largest radius they hold (ascending; visited from the end)
+    nblocks = nb(1)*nb(2)*nb(3)
+    allocate(bkey(nblocks), bxs(nblocks), bys(nblocks), bzs(nblocks))
+    n = 0
+    do l=0, nb(3)-1
+        do k=0, nb(2)-1
+            do j=0, nb(1)-1
+                n = n + 1
+                bkey(n) = blockmax(j, k, l)
+                bxs(n) = j
+                bys(n) = k
+                bzs(n) = l
+            end do
+        end do
+    end do
+    !$omp parallel default(shared)
+    !$omp single
+    call parallel_sort(1, nblocks, bkey, bxs, bys, bzs)
+    !$omp end single
+    !$omp end parallel
+
+    !$omp parallel do default(shared) schedule(dynamic, 16) private(i, n, d, isite, nx, ny, nz, j1, k1, l1, &
+    !$omp atvec1, atvec2, sepvec, rdist2, sigma2_ref, sigma_ref, bin, best, v, t, g2, xq, lo, hi, bx, by, bz)
     do i = 1, nsamples
-
         isite = sites(i)
-        ! The sample's own cubelet always contains it, so the search below always finds a
-        ! sphere; resetting here matches the serial code, which carried the value over
-        sigma2_ref = 0.0
-
         nx = lattice_index(1, n_cubes(isite))
         ny = lattice_index(2, n_cubes(isite))
         nz = lattice_index(3, n_cubes(isite))
@@ -1080,30 +1281,49 @@ subroutine pore_distribution
         atvec1%comp(1) = dble(nx-1)*cube_size+0.5*cube_size ! this is the center of the selected cubelet
         atvec1%comp(2) = dble(ny-1)*cube_size+0.5*cube_size
         atvec1%comp(3) = dble(nz-1)*cube_size+0.5*cube_size
+        xq = atvec1%comp
 
+        ! the sample's own cubelet contains it, so its radius is a first answer
+        best = lattice_rdist2(nx, ny, nz)
 
-        do j=ng_cubes, 1, -1  ! now we go through all  cubelets and see if point atvec1 is within the
-            ! distance between the center of a cubelet and the surface of the nearest neighbour atom
-
-            nx1 = PA2(j)
-            ny1 = PA3(j)
-            nz1 = PA4(j)
-
-            atvec2%comp(1) = dble(nx1-1)*cube_size+0.5*cube_size
-            atvec2%comp(2) = dble(ny1-1)*cube_size+0.5*cube_size
-            atvec2%comp(3) = dble(nz1-1)*cube_size+0.5*cube_size
-
-!!LS 09 01 2018            atvec2 = fundcell_slant(fcell, atvec2)
-            call fundcell_snglminimage(fcell,atvec1,atvec2,sepvec,rdist2)
-
-            if(rdist2>lattice_rdist2(nx1,ny1,nz1)) then    ! if not, cycle
-                cycle
-            else
-                sigma2_ref = lattice_rdist2(nx1,ny1,nz1)       ! if yes, this will be the largest sphere
-                exit                                           ! within which point  atvec1 can sit
+        do n = nblocks, 1, -1
+            if(bkey(n) <= best) exit                      ! no block left can beat it
+            bx = bxs(n)
+            by = bys(n)
+            bz = bzs(n)
+            if(ortho) then
+                ! smallest (periodic) distance from the point to the block's cubelet centres
+                g2 = 0.0d0
+                do d = 1, 3
+                    if(d == 1) j1 = bx
+                    if(d == 2) j1 = by
+                    if(d == 3) j1 = bz
+                    lo = dble(j1*bsz)*cube_size + 0.5*cube_size
+                    hi = dble(min((j1+1)*bsz, ncubes_of(d)) - 1)*cube_size + 0.5*cube_size
+                    t = xq(d) - 0.5d0*(lo + hi)
+                    t = t - fcell%ell(d)*anint(t/fcell%ell(d))
+                    t = max(0.0d0, abs(t) - 0.5d0*(hi - lo))
+                    g2 = g2 + t*t
+                end do
+                if(g2 > bkey(n)*(1.0d0 + 1.0d-9) + 1.0d-9) cycle
             end if
-
+            do l1 = bz*bsz+1, min((bz+1)*bsz, ncubesz)
+                do k1 = by*bsz+1, min((by+1)*bsz, ncubesy)
+                    do j1 = bx*bsz+1, min((bx+1)*bsz, ncubesx)
+                        if(lattice_space(j1,k1,l1)<1) cycle
+                        v = lattice_rdist2(j1,k1,l1)
+                        if(v <= best) cycle
+                        atvec2%comp(1) = dble(j1-1)*cube_size+0.5*cube_size
+                        atvec2%comp(2) = dble(k1-1)*cube_size+0.5*cube_size
+                        atvec2%comp(3) = dble(l1-1)*cube_size+0.5*cube_size
+                        call fundcell_snglminimage(fcell,atvec1,atvec2,sepvec,rdist2)
+                        if(rdist2>v) cycle                ! the point is outside this sphere
+                        best = v
+                    end do
+                end do
+            end do
         end do
+        sigma2_ref = best
 
         sigma_ref = sqrt(sigma2_ref)                   ! sigma here is distance, not diameter
         bin=int(2.0*sigma_ref/binsize)+1               ! distribution bin (2 is needed to make sigma proper diameter)
@@ -1113,6 +1333,7 @@ subroutine pore_distribution
 
     end do
     !$omp end parallel do
+    deallocate(blockmax, bkey, bxs, bys, bzs)
 
     ! Update the cumulative distribution in sample order
     do i = 1, nsamples
@@ -1166,6 +1387,19 @@ subroutine pore_distribution
     write(*,*)
 
     return
+
+contains
+
+    integer function ncubes_of(d)
+        integer, intent(in) :: d
+        if(d == 1) then
+            ncubes_of = ncubesx
+        else if(d == 2) then
+            ncubes_of = ncubesy
+        else
+            ncubes_of = ncubesz
+        end if
+    end function ncubes_of
 
 end subroutine pore_distribution
 

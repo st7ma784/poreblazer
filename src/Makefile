@@ -63,7 +63,9 @@ ifeq ($(FC),gfortran)
 F90FLAGS = 
 DEBUG_FLAGS = 
 # -fopenmp: lattice_calculations and pore_distribution run in parallel (OMP_NUM_THREADS)
-OFLAGS = -O2 -unshared -fopenmp
+# -ffp-contract=off: no fused multiply-adds, so results do not depend on the CPU.
+# -fvect-cost-model=dynamic: vectorise loops of unknown length (elementwise, so same results)
+OFLAGS = -O2 -unshared -fopenmp -ffp-contract=off -fvect-cost-model=dynamic
 LINKERFLAGS = -fopenmp
 endif
 
