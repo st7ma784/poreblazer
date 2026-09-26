@@ -48,6 +48,13 @@ This fork of [richardjgowers/poreblazer](https://github.com/richardjgowers/poreb
   `fundcell_snglMinImage`. `anint` is written in a form the compiler vectorises: it
   truncates |q|, adds 1 when the part dropped is at least 1/2, and restores the sign,
   which is exact for these arguments.
+- **About half the memory** (34 instead of about 70 bytes per grid cube). The
+  accessibility masks are 1 byte instead of 2. Each cube's indices are computed from its
+  number instead of stored. The unused list of geometric cubes is gone. The helium volume
+  reads the helium mask instead of a list (percolation leaves the same cubes in both),
+  and the nitrogen list is sized to its count. The sorted copy for the pore size
+  distribution holds only the radii: the limiting diameter finds the cubes above a
+  radius on the grid. Storage only, so results are unchanged.
 - The Makefile builds with `-fopenmp`, and `OMP_NUM_THREADS` sets the number of threads.
   It also uses `-ffp-contract=off` (no fused multiply-adds, so results do not depend on
   the CPU) and `-fvect-cost-model=dynamic` (vectorises loops of unknown length; the

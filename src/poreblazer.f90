@@ -40,16 +40,26 @@ module lattice
         integer                  :: ncubesx, ncubesy, ncubesz                         ! number of lattice cubes in each direction and other parameters
         integer                  :: ntot, spanning                                    ! total number of lattice cubes,  logical variable for percolation
         integer                  :: nhe_cubes, nn_cubes, ng_cubes                     ! number of lattice cubes accessible to helium, nitrogen and a point, respectively
-        integer*2, allocatable   :: lattice_space(:,:,:)                              ! lattice cubes: cube (i,j,k) is 1 if occupied, 0 if empty (inaccessible)
-        integer*2, allocatable   :: lattice_temp(:,:,:)                               ! temp array for various uses: cube (i,j,k) is 1 if occupied, 0 if empty (inaccessible)
+        integer*1, allocatable   :: lattice_space(:,:,:)                              ! lattice cubes: cube (i,j,k) is 1 if occupied, 0 if empty (inaccessible)
+        integer*1, allocatable   :: lattice_temp(:,:,:)                               ! temp array for various uses: cube (i,j,k) is 1 if occupied, 0 if empty (inaccessible)
         integer, allocatable     :: cl_summary(:,:)                                   ! cluster summary: stores information about percolating clusters and the number of percolated dimensions
-        integer, allocatable     :: lattice_index(:,:)                                ! links the cubelet number and its i, j, k side indicies
         real*8, allocatable      :: lattice_rdist2(:,:,:)                             ! squared distances between the center of the cubelet and nearest atom of the structure
-        integer*2, allocatable   :: lattice_space_he(:,:,:), lattice_space_n(:,:,:)   ! lattice cubes: cube (i,j,k) is 1 if occupied, 0 if empty (inaccessible) for helim and nitrogen
-        integer, allocatable     :: he_cubes(:), n_cubes(:), g_cubes(:)               ! list of cubes available to helium, nitrogen and a point
+        integer*1, allocatable   :: lattice_space_he(:,:,:), lattice_space_n(:,:,:)   ! lattice cubes: cube (i,j,k) is 1 if occupied, 0 if empty (inaccessible) for helim and nitrogen
+        integer, allocatable     :: n_cubes(:)                                        ! nitrogen-accessible cubes, by cube number (sized to their count)
         real*8, allocatable      :: lattice_lj_he(:)                                  ! for each cube i, summary of the LJ interaction between the He atom in the center of the cube and the structure
-        real*8,  allocatable     :: PA1(:)                                            ! array used for percolation analysis, based on site occupation
-        integer, allocatable     :: PA2(:), PA3(:), PA4(:)                            ! arrays used for percolation analysis, based on site occupation
+        real*8,  allocatable     :: PA1(:)                                            ! pore radii (squared) of the geometrically accessible cubes, sorted ascending
+
+contains
+
+    ! The indices (j, k, l) of cube number icount (numbered with j fastest, then k, then l)
+    subroutine cube_ijk(icount, j, k, l)
+        integer, intent(in)  :: icount
+        integer, intent(out) :: j, k, l
+        j = mod(icount - 1, ncubesx) + 1
+        k = mod((icount - 1)/ncubesx, ncubesy) + 1
+        l = (icount - 1)/(ncubesx*ncubesy) + 1
+    end subroutine cube_ijk
+
 end module lattice
 
 
@@ -417,19 +427,17 @@ subroutine initialize(filename)
     ncubesz = int(fcell%eff(3)/cube_size)                ! number of cubelets on z side
 
     ntot = ncubesx*ncubesy*ncubesz                       ! total number of lattice cubelets in the system
-    allocate(lattice_space(ncubesx, ncubesy, ncubesz), lattice_temp(ncubesx, ncubesy, ncubesz), g_cubes(ntot))
-    allocate(lattice_index(3, ntot))
+    allocate(lattice_space(ncubesx, ncubesy, ncubesz), lattice_temp(ncubesx, ncubesy, ncubesz))
     allocate(lattice_rdist2(ncubesx, ncubesy, ncubesz))
-    allocate(lattice_space_he(ncubesx, ncubesy, ncubesz), he_cubes(ntot))
-    allocate(lattice_space_n(ncubesx, ncubesy, ncubesz), n_cubes(ntot))
+    allocate(lattice_space_he(ncubesx, ncubesy, ncubesz))
+    allocate(lattice_space_n(ncubesx, ncubesy, ncubesz))
     allocate(lattice_lj_he(ntot))
     allocate(cl_summary(20,2))
 
-    lattice_space = 0; lattice_temp = 0; g_cubes = 0
-    lattice_index = 0
+    lattice_space = 0; lattice_temp = 0
     lattice_rdist2 = 0.0
-    lattice_space_he = 0;  he_cubes = 0
-    lattice_space_n = 0;   n_cubes = 0
+    lattice_space_he = 0
+    lattice_space_n = 0
     nhe_cubes = 0;  nn_cubes = 0; ng_cubes = 0
     lattice_lj_he = 0.0d0
     cl_summary = 0
@@ -490,17 +498,17 @@ subroutine finalize
     ! These arrays are allocated in initialize
     deallocate(aname,asigma,aeps, amass, asigma2, asigma2_he, aeps_he, asigma_n, asigma2_n)
     deallocate(adsname, coords, atype, matvec)
-    deallocate(lattice_space, lattice_temp, g_cubes)
-    deallocate(lattice_index)
+    deallocate(lattice_space, lattice_temp)
     deallocate(lattice_rdist2)
-    deallocate(lattice_space_he, he_cubes)
-    deallocate(lattice_space_n, n_cubes)
+    deallocate(lattice_space_he)
+    deallocate(lattice_space_n)
     deallocate(lattice_lj_he)
     deallocate(cl_summary)
     deallocate(psd_cumul, psd)
 
-    ! These arrays are allocated in lattice_calculations
-    deallocate(PA1, PA2, PA3, PA4)
+    ! Allocated in lattice_calculations and pore_distribution
+    if(allocated(n_cubes)) deallocate(n_cubes)
+    if(allocated(PA1)) deallocate(PA1)
 end subroutine finalize
 
 !--------------------------------------------------------------------------------------
@@ -656,27 +664,31 @@ subroutine lattice_calculations
     !$omp end parallel
     deallocate(all_atoms, ax, ay, az, aov, ahalf, as2he, alj, pfirst, plast)
 
-    ! Lists of geometrically, helium- and nitrogen-accessible cubelets, in cubelet order
+    ! Counts of geometrically, helium- and nitrogen-accessible cubelets, and the list of
+    ! nitrogen-accessible cubelets in cubelet order (the PSD samples from it). The helium
+    ! volume reads the helium mask directly.
     do l=1, ncubesz
         do k=1, ncubesy
             do j=1, ncubesx
                 if(lattice_space(j,k,l) < 1) cycle
-                icount = ((l-1) * ncubesx * ncubesy) + ((k-1) * ncubesx) + j
                 ng_cubes = ng_cubes + 1
-                g_cubes(ng_cubes) = icount
-                if(lattice_space_he(j,k,l) == 1) then
-                    nhe_cubes = nhe_cubes + 1
-                    he_cubes(nhe_cubes) = icount
-                end if
-                if(lattice_space_n(j,k,l) == 1) then
-                    nn_cubes = nn_cubes + 1
-                    n_cubes(nn_cubes) = icount
-                end if
+                if(lattice_space_he(j,k,l) == 1) nhe_cubes = nhe_cubes + 1
+                if(lattice_space_n(j,k,l) == 1) nn_cubes = nn_cubes + 1
             end do
         end do
     end do
-
-    allocate(PA1(ng_cubes), PA2(ng_cubes), PA3(ng_cubes), PA4(ng_cubes))
+    allocate(n_cubes(max(1, nn_cubes)))
+    n_cubes = 0
+    n = 0
+    do l=1, ncubesz
+        do k=1, ncubesy
+            do j=1, ncubesx
+                if(lattice_space(j,k,l) < 1 .or. lattice_space_n(j,k,l) /= 1) cycle
+                n = n + 1
+                n_cubes(n) = ((l-1) * ncubesx * ncubesy) + ((k-1) * ncubesx) + j
+            end do
+        end do
+    end do
 
     write(*,*) "!-------------------------------------------------------!"
     write(*,*) "! Preliminary lattice complete                          !"
@@ -782,8 +794,6 @@ contains
                 (rdist2_ref < hicut2 .and. rdist_surface_ref + 0.5*maxsigma < hicut)
         if(.not. exact) return
 
-        ! create a look-up table connecting the cubelet number with its indicies
-        lattice_index(:, icount) = (/ j, k, l /)
         lattice_lj_he(icount) = lj_sum
 
         if(overlap.eqv..True.) then                          ! if an overlap was detected, this whole cubelet is ignored
@@ -822,7 +832,7 @@ subroutine helium_lattice
     write(*,*) "!-------------------------------------------------------!"
     write(*,*)
 
-    call percolation_calc(lattice_space_he, he_cubes, nhe_cubes, cl_summary)
+    call percolation_calc(lattice_space_he, cl_summary=cl_summary)
 
     write(*,*) "!-------------------------------------------------------!"
     write(*,*) "! Generation of helium-accessible lattice complete      !"
@@ -889,7 +899,7 @@ subroutine helium_volume
     use results
 
     implicit none
-    integer ::                            i, j, cube_number
+    integer ::                            i, j, k, l, cube_number
     real*8  ::                            lj_energy, bf !, pore_v_he, pore_geom, volume  ! Moved these variables to the results module.
 
     write(*,*) "!-------------------------------------------------------!"
@@ -899,14 +909,21 @@ subroutine helium_volume
 
     pore_v_he = 0.0
 
-    do i=1, nhe_cubes
+    ! The helium-accessible cubelets that percolate, in cubelet order: the percolation
+    ! analysis leaves exactly these marked in lattice_space_he (upstream kept a list)
+    do l=1, ncubesz
+    do k=1, ncubesy
+    do j=1, ncubesx
 
-        cube_number = he_cubes(i)
+        if(lattice_space_he(j,k,l) /= 1) cycle
+        cube_number = ((l-1) * ncubesx * ncubesy) + ((k-1) * ncubesx) + j
 
         lj_energy = lattice_lj_he(cube_number)      ! total LJ energy of cubelet cube_number and its environment within cut-off distance
         lj_energy = 4.0 * lj_energy
         bf = exp(-lj_energy/temp)                   ! Boltzmann factor for cubelet cube_number
         pore_v_he = pore_v_he + bf                  ! second virial as a sum of Boltzmann factors over all cubelets
+    end do
+    end do
     end do
 
     pore_v_he = pore_v_he/dble(ntot)            ! averaging over the whole sample
@@ -1189,26 +1206,23 @@ subroutine pore_distribution
     ! here we go through all cubelets geometrically accessible, store distances between the centers of cubelets
     ! and the surface of the nearest neighbour atom in PA1 array, and sort PA1 in an ascending order
 
+    allocate(PA1(max(1, ng_cubes)))
     do l=1, ncubesz
         do k=1, ncubesy
             do j=1, ncubesx
                 if(lattice_space(j,k,l)<1) cycle
                 icount = icount + 1
                 PA1(icount) = lattice_rdist2(j,k,l)
-                PA2(icount) = j
-                PA3(icount) = k
-                PA4(icount) = l
             end do
         end do
     end do
 
-    ! Sorted on threads. The order of cubelets with equal distances can differ from the
-    ! serial sort, which changes nothing: the search below takes the distance of the first
-    ! containing sphere, the same for every cubelet with that distance, and the limiting
-    ! diameter uses only the distances.
+    ! Only the radii are kept and sorted (upstream carried each cubelet's indices along):
+    ! the search below finds spheres by blocks of the grid, and the limiting diameter
+    ! needs only the sorted radii and the cubelets above a radius, which it finds on the grid.
     !$omp parallel default(shared)
     !$omp single
-    call parallel_sort(1, ng_cubes, PA1, PA2, PA3, PA4)
+    call parallel_sort_values(1, ng_cubes, PA1)
     !$omp end single
     !$omp end parallel
 
@@ -1274,9 +1288,7 @@ subroutine pore_distribution
     !$omp atvec1, atvec2, sepvec, rdist2, sigma2_ref, sigma_ref, bin, best, v, t, g2, xq, lo, hi, bx, by, bz)
     do i = 1, nsamples
         isite = sites(i)
-        nx = lattice_index(1, n_cubes(isite))
-        ny = lattice_index(2, n_cubes(isite))
-        nz = lattice_index(3, n_cubes(isite))
+        call cube_ijk(n_cubes(isite), nx, ny, nz)
 
         atvec1%comp(1) = dble(nx-1)*cube_size+0.5*cube_size ! this is the center of the selected cubelet
         atvec1%comp(2) = dble(ny-1)*cube_size+0.5*cube_size
@@ -1418,7 +1430,7 @@ subroutine limiting_diameter
 
     implicit none
     real*8  :: rhigh, rlow, rmiddle, rmax, rdiff, rdiff_old
-    integer :: i, j, percolation_type
+    integer :: i, j, percolation_type, i1, k1, l1
 
     write(*,*) "!-------------------------------------------------------!"
     write(*,*) "! Starting limiting pore diameter and maximum pore size !"
@@ -1439,12 +1451,25 @@ subroutine limiting_diameter
         if(abs(rdiff)<0.25.or.(rdiff==rdiff_old)) exit ! convergence is achieved
         rmiddle = 0.5*(rhigh+rlow)
 
-        lattice_temp = 0
-
+        ! j: the last sorted radius below rmiddle, as upstream finds it
         do j=ng_cubes, 1, -1
             if(PA1(j) < rmiddle) exit
-            lattice_temp(PA2(j), PA3(j), PA4(j)) = 1
         end do
+
+        ! the geometrically accessible cubelets with a radius of at least rmiddle (upstream
+        ! marked the sorted entries above j, the same cubelets)
+        !$omp parallel do default(shared) private(i1, k1, l1)
+        do l1=1, ncubesz
+            do k1=1, ncubesy
+                do i1=1, ncubesx
+                    lattice_temp(i1,k1,l1) = 0
+                    if(lattice_space(i1,k1,l1) >= 1) then
+                        if(.not. (lattice_rdist2(i1,k1,l1) < rmiddle)) lattice_temp(i1,k1,l1) = 1
+                    end if
+                end do
+            end do
+        end do
+        !$omp end parallel do
 
         call percolation_calc_simple(lattice_temp, cl_summary, spanning)
 
@@ -1516,9 +1541,7 @@ subroutine nitrogen_lattice_vis(option)
     write(110,*)
 
     do i=1, nn_cubes
-        nx = lattice_index(1, n_cubes(i))
-        ny = lattice_index(2, n_cubes(i))
-        nz = lattice_index(3, n_cubes(i))
+        call cube_ijk(n_cubes(i), nx, ny, nz)
 
         x = dble(nx-1)*cube_size+0.5*cube_size ! this is the center of the selected cubelet
         y = dble(ny-1)*cube_size+0.5*cube_size
@@ -1632,6 +1655,65 @@ recursive subroutine parallel_sort(lo, hi, arr, brr, crr, drr)
     !$omp taskwait
 
 end subroutine parallel_sort
+
+!==============================================================
+! Ascending sort of arr(lo:hi) (values only): quicksort with the two halves of each
+! partition as OpenMP tasks, insertion sort for short ranges. Call from inside a parallel
+! region's single construct.
+
+recursive subroutine parallel_sort_values(lo, hi, arr)
+    implicit none
+    integer, intent(in)       :: lo, hi
+    real*8                    :: arr(*)
+    integer, parameter        :: cutoff = 100000, small = 16
+    integer                   :: i, j
+    real*8                    :: pivot, temp
+
+    if(hi - lo < small) then
+        do i=lo+1, hi
+            temp = arr(i)
+            j = i - 1
+            do while(j >= lo)
+                if(arr(j) <= temp) exit
+                arr(j+1) = arr(j)
+                j = j - 1
+            end do
+            arr(j+1) = temp
+        end do
+        return
+    end if
+
+    ! Hoare partition around the median of the first, middle and last values
+    pivot = max(min(arr(lo), arr(hi)), min(max(arr(lo), arr(hi)), arr((lo+hi)/2)))
+    i = lo - 1
+    j = hi + 1
+    do
+        do
+            i = i + 1
+            if(arr(i) >= pivot) exit
+        end do
+        do
+            j = j - 1
+            if(arr(j) <= pivot) exit
+        end do
+        if(i >= j) exit
+        temp = arr(i); arr(i) = arr(j); arr(j) = temp
+    end do
+
+    if(hi - lo < cutoff) then
+        call parallel_sort_values(lo, j, arr)
+        call parallel_sort_values(j+1, hi, arr)
+    else
+        !$omp task default(shared) firstprivate(lo, j)
+        call parallel_sort_values(lo, j, arr)
+        !$omp end task
+        !$omp task default(shared) firstprivate(hi, j)
+        call parallel_sort_values(j+1, hi, arr)
+        !$omp end task
+        !$omp taskwait
+    end if
+
+end subroutine parallel_sort_values
 
 subroutine sort(n,arr,brr,crr,drr)
     integer n,m,nstack

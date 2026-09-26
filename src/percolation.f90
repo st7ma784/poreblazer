@@ -25,9 +25,9 @@ Contains
 
     Subroutine percolation_calc(lattice_in, n_sites, nn_sites, cl_summary)
 
-        Integer*2, Dimension(:,:,:), Intent(InOut)                                     :: lattice_in
-        Integer, Dimension(:), Intent(InOut)                                         :: n_sites
-        Integer, Intent(InOut)                                                       :: nn_sites
+        Integer*1, Dimension(:,:,:), Intent(InOut)                                     :: lattice_in
+        Integer, Dimension(:), Intent(InOut), Optional                               :: n_sites
+        Integer, Intent(InOut), Optional                                             :: nn_sites
         Integer, Dimension(:,:), Intent(InOut)                                       :: cl_summary
         Integer, Dimension(:,:,:), allocatable                                       :: cluster
         Integer, Dimension(:), allocatable                                           :: cl
@@ -58,7 +58,7 @@ Contains
 
     Subroutine percolation_calc_simple(lattice_in, cl_summary, spanning)
 
-        Integer*2, Dimension(:,:,:), Intent(InOut)                                       :: lattice_in
+        Integer*1, Dimension(:,:,:), Intent(InOut)                                       :: lattice_in
         Integer, Dimension(:,:), Intent(InOut)                                         :: cl_summary
         Integer, Dimension(:,:,:), allocatable                                         :: cluster
         Integer, Dimension(:), allocatable                                             :: cl,trcl
@@ -92,7 +92,7 @@ Contains
 
     Subroutine clusteranalysis(ngrid,cluster,cl,trcl,nc)
 
-        Integer*2, Dimension(:,:,:), Intent(InOut)     :: ngrid
+        Integer*1, Dimension(:,:,:), Intent(InOut)     :: ngrid
         Integer, Dimension(:,:,:), Intent(InOut)  :: cluster
         Integer, Dimension(:), Intent(InOut)      :: cl,trcl
         Integer, Intent(InOut)                       :: nc
@@ -188,7 +188,7 @@ Contains
 !---------------------------------------------------------------------
 
     Subroutine clusteranalysis_exact(ngrid, cluster, cl, nc)
-        Integer*2, Dimension(:,:,:), Intent(In)   :: ngrid
+        Integer*1, Dimension(:,:,:), Intent(In)   :: ngrid
         Integer, Dimension(:,:,:), Intent(InOut)  :: cluster
         Integer, Dimension(:), Intent(InOut)      :: cl
         Integer, Intent(InOut)                    :: nc
@@ -265,7 +265,7 @@ Contains
     Subroutine reveal_local(i0,j0,k0,cluster,ngrid,local, scenario)
         Integer, Intent(In)                      :: i0,j0,k0
         Integer, Dimension(:,:,:), Intent(In)     :: cluster
-        Integer*2, Dimension(:,:,:), Intent(In)     ::ngrid
+        Integer*1, Dimension(:,:,:), Intent(In)     ::ngrid
         Integer, Dimension(:), Intent(InOut)        :: local
         Integer, Intent(InOut)                     :: scenario
         Integer                                  :: i1, j1, k1, i, j, k, ic
@@ -374,7 +374,7 @@ Contains
     Subroutine scenario_1(i0,j0,k0, cluster,ngrid, cl, trcl, nc)
         Integer, Intent(In)                         :: i0,j0,k0
         Integer, Dimension(:,:,:), Intent(InOut) :: cluster
-        Integer*2, Dimension(:,:,:), Intent(InOut) :: ngrid
+        Integer*1, Dimension(:,:,:), Intent(InOut) :: ngrid
         Integer, Dimension(:), Intent(InOut)      :: cl, trcl
         Integer, Intent(InOut)                      :: nc
 
@@ -391,7 +391,7 @@ Contains
     Subroutine scenario_2(i0,j0,k0, cluster,ngrid, cl, trcl, nc)
         Integer, Intent(In)                         :: i0,j0,k0
         Integer, Dimension(:,:,:), Intent(InOut) :: cluster
-        Integer*2, Dimension(:,:,:), Intent(InOut) :: ngrid
+        Integer*1, Dimension(:,:,:), Intent(InOut) :: ngrid
         Integer, Dimension(:), Intent(InOut)      :: cl, trcl
         Integer, Intent(InOut)                      :: nc
         Integer                                     :: i,j,k,i1,j1,k1, lowest, current, trlowest
@@ -575,15 +575,15 @@ Contains
 
     subroutine span(lattice_in, n_sites, nn_sites, cluster, cl, nc, cl_summary)
 
-        Integer*2, Dimension(:,:,:), Intent(InOut) :: lattice_in
-        Integer, Dimension(:), Intent(InOut)      :: n_sites
-        Integer, Intent(InOut)                    :: nn_sites
+        Integer*1, Dimension(:,:,:), Intent(InOut) :: lattice_in
+        Integer, Dimension(:), Intent(InOut), Optional :: n_sites     ! the sites of the spanning clusters, if wanted
+        Integer, Intent(InOut), Optional          :: nn_sites
         Integer, Dimension(:,:,:), Intent(In)     :: cluster
         Integer, Dimension(:), Intent(In)         :: cl
         Integer, Intent(In)                       :: nc
         Integer, Dimension(:,:), Intent(Out)      :: cl_summary
         Integer                                   :: x_span, y_span, z_span,potentialspan !x_span=0 if there is no spanning cluster
-        Integer                                   :: n,i,j,k, LX, LY, LZ, ic, icount, spanning, i1
+        Integer                                   :: n,i,j,k, LX, LY, LZ, ic, icount, spanning, i1, nn
         Integer, Dimension(:), allocatable        :: cand
         Logical(kind=1), Dimension(:,:), allocatable :: xo, yo, zo
         Integer, Dimension(:), allocatable :: x_array, y_array, z_array
@@ -627,27 +627,24 @@ Contains
         end if
 
         lattice_in = 0
-        nn_sites = 0
-        n_sites = 0
+        nn = 0
+        if(present(n_sites)) n_sites = 0
         icount = 0
-
         do k=1, LZ
             do j=1, LY
                 do i=1, LX
                     icount = icount + 1
-
                     do i1=1, ic
                         if(cluster(i,j,k) ==  cl_summary(i1+1, 1)) then
                             lattice_in(i,j,k) = 1
-                            nn_sites = nn_sites + 1
-                            n_sites(nn_sites) = icount
+                            nn = nn + 1
+                            if(present(n_sites)) n_sites(nn) = icount
                         end if
-
                     end do
                 end do
             end do
         end do
-
+        if(present(nn_sites)) nn_sites = nn
         deallocate(x_array, y_array, z_array)
         
     end subroutine span
@@ -663,7 +660,7 @@ Contains
 
     subroutine span_simple(lattice_in, cluster, cl, nc, cl_summary, spanning)
 
-        Integer*2, Dimension(:,:,:), Intent(InOut)  :: lattice_in
+        Integer*1, Dimension(:,:,:), Intent(InOut)  :: lattice_in
         Integer, Dimension(:,:,:), Intent(InOut)  :: cluster(:,:,:)
         Integer, Dimension(:), Intent(In)         :: cl
         Integer, Intent(In)                       :: nc
@@ -771,7 +768,7 @@ Contains
     subroutine update(i0,j0,k0, cluster,ngrid, cl, nc)
         Integer, Intent(In)                         :: i0,j0,k0
         Integer, Dimension(:,:,:), Intent(InOut) :: cluster
-        Integer*2, Dimension(:,:,:), Intent(InOut) :: ngrid
+        Integer*1, Dimension(:,:,:), Intent(InOut) :: ngrid
         Integer, Dimension(:), Intent(InOut)      :: cl
         Integer, Intent(InOut)                      :: nc
         Integer                                     :: i,j,k,i1,j1,k1, lowest
