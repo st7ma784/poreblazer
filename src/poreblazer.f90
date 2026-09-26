@@ -433,11 +433,15 @@ subroutine lattice_calculations
     write(*,*) "!-------------------------------------------------------!"
     write(*,*)
 
-    icount = 0
-
-    ! sepvec is never used, but presumably giving each thread its own copy will increase performance.
-    !$omp parallel do private(overlap, icount, rdist2, rdist_surface, rdist_surface_ref, rdist2_ref, atvec1, atvec2, &
-    !$omp sepvec, amin)
+    ! Each cubelet writes only its own elements of the lattice arrays, so the cubelets are
+    ! independent and run in parallel. Every temporary is private: in upstream 3.0.5 the
+    ! Lennard-Jones temporaries were shared between threads (a race, and slow, as every
+    ! thread wrote the same variables), and the cubelet lists were filled with a counter
+    ! read after other threads could have incremented it. The lists are now built
+    ! afterwards, in cubelet order, so the results do not depend on the number of threads.
+    !$omp parallel do collapse(3) default(shared) schedule(static) &
+    !$omp private(i, j, k, l, icount, overlap, amin, rdist2, rdist2_ref, rdist_surface, &
+    !$omp rdist_surface_ref, sig2_rdist2, rdist6, rdist12, lj_energy, atvec1, sepvec)
     do l=1, ncubesz                                    ! we go cubelet by cubelet
         do k=1, ncubesy
             do j=1, ncubesx
@@ -489,34 +493,42 @@ subroutine lattice_calculations
                     cycle
                 end if
 
-                lattice_space(j,k,l) = 1                          ! otherwise we add it to the list of geometrically accessible cubelets lattice_space(j,k,l) = 1
-                ! We could save time by splitting the array into n/num_threads
-                ! pieces, making ng_cubes and friends private and sorting the
-                ! arrays in serial.
-                !$omp atomic
-                ng_cubes = ng_cubes + 1
-                g_cubes(ng_cubes) = icount
+                lattice_space(j,k,l) = 1                          ! otherwise the cubelet is geometrically accessible
 
                 lattice_rdist2(j,k,l) = rdist_surface_ref*rdist_surface_ref ! lattice_rdist2(j,k,l) stores the shortest squared distance between cubelet j, k, l and nearest atom (without overlap)
 
-                if(rdist2_ref>0.25*asigma2_he(atype(amin))) then  ! next few lines detect if the cubelet is accessible to helium atom and update the list of
-                    lattice_space_he(j,k,l) = 1                   ! helium accessible cubelets lattice_space_He(j,k,l)
-                    !$omp atomic
-                    nhe_cubes = nhe_cubes + 1
-                    he_cubes(nhe_cubes) = icount
+                if(rdist2_ref>0.25*asigma2_he(atype(amin))) then  ! accessible to a helium atom
+                    lattice_space_he(j,k,l) = 1
                 end if
 
-                if(rdist2_ref>asigma2_n(atype(amin))) then        ! next few lines detect if the cubelet is accessible to nitrogen atom and update the list of
-                    lattice_space_n(j,k,l) = 1                    ! nitrogen accessible cubelets lattice_space_N(j,k,l)
-                    !$omp atomic
-                    nn_cubes = nn_cubes + 1
-                    n_cubes(nn_cubes) = icount
+                if(rdist2_ref>asigma2_n(atype(amin))) then        ! accessible to a nitrogen atom
+                    lattice_space_n(j,k,l) = 1
                 end if
 
             end do
         end do
     end do
     !$omp end parallel do
+
+    ! Lists of geometrically, helium- and nitrogen-accessible cubelets, in cubelet order
+    do l=1, ncubesz
+        do k=1, ncubesy
+            do j=1, ncubesx
+                if(lattice_space(j,k,l) < 1) cycle
+                icount = ((l-1) * ncubesx * ncubesy) + ((k-1) * ncubesx) + j
+                ng_cubes = ng_cubes + 1
+                g_cubes(ng_cubes) = icount
+                if(lattice_space_he(j,k,l) == 1) then
+                    nhe_cubes = nhe_cubes + 1
+                    he_cubes(nhe_cubes) = icount
+                end if
+                if(lattice_space_n(j,k,l) == 1) then
+                    nn_cubes = nn_cubes + 1
+                    n_cubes(nn_cubes) = icount
+                end if
+            end do
+        end do
+    end do
 
     allocate(PA1(ng_cubes), PA2(ng_cubes), PA3(ng_cubes), PA4(ng_cubes))
 
@@ -840,6 +852,8 @@ subroutine pore_distribution
     integer                               :: i, j, k, l, nx, ny, nz, nx1, ny1, nz1, icount, m, bin, isite
     real*8                                :: sigma_ref, sigma2_ref, rdist2
     real*8                                :: deldis1, deldis2, deldis
+    integer, parameter                    :: nsamples = 10000
+    integer, allocatable                  :: sites(:), bins(:)
 
 
     write(*,*) "!-------------------------------------------------------!"
@@ -875,12 +889,24 @@ subroutine pore_distribution
         return
     end if
 
-    sigma2_ref=0.0
-
-    do i = 1, 10000
-
+    ! Draw every sample site first, in the order the serial code drew them, so that the
+    ! samples can run in parallel and give the same distribution as before
+    allocate(sites(nsamples), bins(nsamples))
+    do i = 1, nsamples
         isite = int(rranf()*dble(nn_cubes)) + 1 ! randomly select an available cubelet
         if(isite > nn_cubes) isite = nn_cubes
+        sites(i) = isite
+    end do
+
+    !$omp parallel do default(shared) schedule(dynamic, 16) &
+    !$omp private(i, j, isite, nx, ny, nz, nx1, ny1, nz1, atvec1, atvec2, sepvec, rdist2, &
+    !$omp sigma2_ref, sigma_ref, bin)
+    do i = 1, nsamples
+
+        isite = sites(i)
+        ! The sample's own cubelet always contains it, so the search below always finds a
+        ! sphere; resetting here matches the serial code, which carried the value over
+        sigma2_ref = 0.0
 
         nx = lattice_index(1, n_cubes(isite))
         ny = lattice_index(2, n_cubes(isite))
@@ -918,11 +944,18 @@ subroutine pore_distribution
         bin=int(2.0*sigma_ref/binsize)+1               ! distribution bin (2 is needed to make sigma proper diameter)
 
         if (bin > ubound(psd_cumul, 1)) bin = ubound(psd_cumul, 1)
-        do m=1, bin
-            psd_cumul(m)=psd_cumul(m)+1                    ! update cumulative distribution
-        end do
+        bins(i) = bin
 
     end do
+    !$omp end parallel do
+
+    ! Update the cumulative distribution in sample order
+    do i = 1, nsamples
+        do m=1, bins(i)
+            psd_cumul(m)=psd_cumul(m)+1
+        end do
+    end do
+    deallocate(sites, bins)
 
     open(13, file='psd_cumulative.txt', status='unknown') ! The file for cumulative Vp function
     open(14, file='psd.txt', status='unknown')            ! File containing pore size distribution

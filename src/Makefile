@@ -62,8 +62,9 @@ endif
 ifeq ($(FC),gfortran)
 F90FLAGS = 
 DEBUG_FLAGS = 
-OFLAGS = -O2 -unshared
-LINKERFLAGS = 
+# -fopenmp: lattice_calculations and pore_distribution run in parallel (OMP_NUM_THREADS)
+OFLAGS = -O2 -unshared -fopenmp
+LINKERFLAGS = -fopenmp
 endif
 
 ### ------------ define flags for nagf95, intel-linux compiler by NAG ---------
