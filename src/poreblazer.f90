@@ -75,10 +75,13 @@ module results
 end module results
 
 module atomcells
-        ! Atoms binned into cells, for searches that need only nearby atoms. Used for
-        ! orthorhombic cells only: there the minimum image is taken component by component,
-        ! so the gap between two cells bounds the distance between any points in them.
-        ! Otherwise a single cell holds every atom.
+        ! Atoms binned into cells, for searches that need only nearby atoms. The cells are
+        ! boxes in the cell's slanted coordinates, in which Poreblazer's minimum image wraps
+        ! each component, so the gap g between two cells bounds the slanted separation of
+        ! any points in them. The Cartesian distance is |U d| for the unslant matrix U, and
+        ! |U d|^2 >= metric |d|^2, where metric is a lower bound on the smallest eigenvalue
+        ! of U^T U (atomcells_metric): so a search to reach/sqrt(metric) in slanted
+        ! coordinates finds every atom within reach. metric is 1 in orthorhombic cells.
         implicit none
         integer                  :: ncell(3) = 1, ncells = 1                          ! cells along each side, in total
         real*8                   :: cellw(3) = 0.0d0                                  ! cell widths (A)
@@ -125,6 +128,27 @@ contains
         end do
         deallocate(atom_cell, fill)
     end subroutine atomcells_build
+
+    ! A lower bound on the smallest eigenvalue of U^T U, U the unslant matrix (Gershgorin's
+    ! circles, less a margin for rounding): 1 in orthorhombic cells, 0.5 for a hexagonal
+    ! cell. Zero or less when the cell is too oblique for the bound to help.
+    real*8 function atomcells_metric()
+        use parameters, only: fcell
+        use fundcell, only:   fundcell_isortho
+        real*8                   :: u(3,3), g(3,3)
+        integer                  :: i, j
+        if(fundcell_isortho(fcell)) then
+            atomcells_metric = 1.0d0
+            return
+        end if
+        u = fcell%unslantmatrix%comp
+        g = matmul(transpose(u), u)
+        atomcells_metric = huge(0.0d0)
+        do i=1, 3
+            atomcells_metric = min(atomcells_metric, g(i,i) - sum(abs(g(i,:))) + abs(g(i,i)))
+        end do
+        atomcells_metric = atomcells_metric*(1.0d0 - 1.0d-9)
+    end function atomcells_metric
 
     ! The cell (from 0) along side d of coordinate x, wrapped into the cell
     integer function atomcells_index(x, d)
@@ -534,7 +558,7 @@ subroutine lattice_calculations
 
     real*8, parameter                  :: cell_target = 2.0d0       ! width of the cell-list cells (A)
     real*8, parameter                  :: margin = 1.0d-3           ! cells are searched to hicut + margin (A)
-    real*8                             :: maxsigma, reach, x, xl, yl, zl
+    real*8                             :: maxsigma, reach, x, xl, yl, zl, metric, u(3,3)
     integer*4                          :: i, j, k, l, icount, a, b, d, n, ix, iy, iz, ncand, maxnb
     integer                            :: c(3), ncubes(3), nnb(3)
     logical                            :: exact, ortho
@@ -563,15 +587,18 @@ subroutine lattice_calculations
     ! and the nearest atom are exactly those found by checking every atom. When the nearest
     ! atom or the nearest surface could lie beyond the cutoff (a pore wider than about twice
     ! the cutoff), the cubelet checks every atom instead, as upstream does. The list is used
-    ! for orthorhombic cells only (module atomcells); other cells use a single cell.
+    ! in slanted coordinates, to the cutoff scaled for the cell's shape (module atomcells).
     !
     ! The distances are computed in a loop of their own over contiguous copies of the
-    ! positions, with the arithmetic of fundcell_snglMinImage, so the compiler can keep it
+    ! positions, with the arithmetic of fundcell_snglMinImage (and, in non-orthorhombic
+    ! cells, of its multiplication by the unslant matrix), so the compiler can keep it
     ! tight; the loop that uses them runs in atom order as before.
     maxsigma = maxval(asigma)
-    reach = hicut + margin
     ortho = fundcell_isortho(fcell)
-    call atomcells_build(cell_target, ortho .and. 0.5*maxsigma < hicut)
+    metric = atomcells_metric()
+    reach = (hicut + margin)/sqrt(max(metric, tiny(0.0d0)))   ! in slanted coordinates
+    call atomcells_build(cell_target, metric > 0.05d0 .and. 0.5*maxsigma < hicut)
+    u = fcell%unslantmatrix%comp
     ncubes = (/ ncubesx, ncubesy, ncubesz /)
     maxnb = maxval(ncell)
     xl = fcell%ell(1)
@@ -711,7 +738,7 @@ contains
         real*8, intent(inout)              :: d2(nlist)
         logical, intent(out)               :: exact
         type(vectype)                      :: atvec1, sepvec
-        real*8                             :: px, py, pz, d1, dd2, d3, q1, q2, q3, r1, r2, r3
+        real*8                             :: px, py, pz, d1, dd2, d3, q1, q2, q3, r1, r2, r3, s1, s2, s3
         real*8                             :: rdist2, rdist6, rdist12, rdist2_ref, rdist_surface, rdist_surface_ref
         real*8                             :: sig2_rdist2, lj_energy, lj_sum
         integer                            :: n, icount, amin
@@ -722,14 +749,15 @@ contains
         ! calculate the coordinates of the center of each cubelet
         atvec1%comp = (/dble(j-1), dble(k-1), dble(l-1)/) * cube_size + (0.5 * cube_size)
 
-        ! squared minimum-image distances, as fundcell_snglMinImage computes them
+        ! squared minimum-image distances, as fundcell_snglMinImage computes them; the
+        ! wrap is anint(q), written so that it vectorises: truncate |q|, add 1 when the part
+        ! dropped is at least 1/2, restore the sign. Exact for |q| < 2**31 (separations are
+        ! within a few cell lengths), so the distances are unchanged. One loop per cell
+        ! shape, so that each vectorises.
+        px = atvec1%comp(1)
+        py = atvec1%comp(2)
+        pz = atvec1%comp(3)
         if(ortho) then
-            px = atvec1%comp(1)
-            py = atvec1%comp(2)
-            pz = atvec1%comp(3)
-            ! anint(q), written so that it vectorises: truncate |q|, add 1 when the part
-            ! dropped is at least 1/2, restore the sign. Exact for |q| < 2**31 (separations
-            ! are within a few cell lengths), so the distances are unchanged.
             do n=1, nlist
                 d1 = px - x(n)
                 dd2 = py - y(n)
@@ -750,7 +778,27 @@ contains
             end do
         else
             do n=1, nlist
-                call fundcell_snglMinImage(fcell,atvec1,matvec(list(n)),sepvec,d2(n))
+                d1 = px - x(n)
+                dd2 = py - y(n)
+                d3 = pz - z(n)
+                q1 = d1/xl
+                q2 = dd2/yl
+                q3 = d3/zl
+                r1 = dble(int(abs(q1)))
+                r2 = dble(int(abs(q2)))
+                r3 = dble(int(abs(q3)))
+                r1 = r1 + merge(1.0d0, 0.0d0, abs(q1) - r1 >= 0.5d0)
+                r2 = r2 + merge(1.0d0, 0.0d0, abs(q2) - r2 >= 0.5d0)
+                r3 = r3 + merge(1.0d0, 0.0d0, abs(q3) - r3 >= 0.5d0)
+                d1 = d1 - xl*(sign(r1, q1))
+                dd2 = dd2 - yl*(sign(r2, q2))
+                d3 = d3 - zl*(sign(r3, q3))
+                ! the unslant matrix times (d1, dd2, d3), and its squared norm, summed in the
+                ! order of matrix_m_mult_v and vector_getnormsq
+                s1 = u(1,1)*d1 + u(1,2)*dd2 + u(1,3)*d3
+                s2 = u(2,1)*d1 + u(2,2)*dd2 + u(2,3)*d3
+                s3 = u(3,1)*d1 + u(3,2)*dd2 + u(3,3)*d3
+                d2(n) = s1*s1+s2*s2+s3*s3
             end do
         end if
 
@@ -989,7 +1037,8 @@ subroutine surface_area
     integer, parameter                    :: block = 256        ! atoms whose random numbers are drawn at a time
     real*8                                :: reach, xl, yl, zl, d1, d2, d3
     integer                               :: i0, i1, ii, m, n1, n2, n3, b, maxnb, c(3), nnb(3)
-    logical                               :: ortho
+    logical                               :: ortho, usecells
+    real*8                                :: metric
     real*8, allocatable                   :: rnd(:,:,:), ax(:), ay(:), az(:), gap(:,:)
     integer, allocatable                  :: counts(:), nbr(:,:)
 
@@ -1012,11 +1061,13 @@ subroutine surface_area
     ! The trial points are the same as upstream's: every trial draws its two random numbers
     ! before any test, so the numbers for a block of atoms are drawn first, in upstream's
     ! order, and the atoms then run in parallel. The surface area is summed in atom order.
-    ! The overlap test checks only atoms in nearby cells (module atomcells; orthorhombic
-    ! cells only), as no farther atom can overlap the point.
+    ! The overlap test checks only atoms in nearby cells (module atomcells), as no farther
+    ! atom can overlap the point.
     ortho = fundcell_isortho(fcell)
-    reach = sqrt(coeff_surface2*maxval(asigma2_n)) + 1.0d-3
-    call atomcells_build(reach, ortho)
+    metric = atomcells_metric()
+    usecells = metric > 0.05d0
+    reach = (sqrt(coeff_surface2*maxval(asigma2_n)) + 1.0d-3)/sqrt(max(metric, tiny(0.0d0)))
+    call atomcells_build(reach, usecells)
     maxnb = maxval(ncell)
     xl = fcell%ell(1)
     yl = fcell%ell(2)
@@ -1079,7 +1130,7 @@ subroutine surface_area
             ! now we perform the overlap test, i.e. we ensure that the selected point is not inside
             ! any other surf_coeff*(atom_diamter+probe_diameter)/2 distance in the system
             deny=.False.
-            if(ortho) then
+            if(usecells) then
                 do m=1, 3
                     c(m) = atomcells_index(atvec1%comp(m), m)
                     call atomcells_neighbours(c(m), m, reach, nbr(:,m), gap(:,m), nnb(m))
@@ -1092,14 +1143,18 @@ subroutine surface_area
                             do m=cell_start(b), cell_start(b+1)-1
                                 k = cell_atoms(m)
                                 if(k==i) cycle
-                                ! as fundcell_snglMinImage computes it
-                                d1 = atvec1%comp(1) - ax(k)
-                                d2 = atvec1%comp(2) - ay(k)
-                                d3 = atvec1%comp(3) - az(k)
-                                d1 = d1 - xl*(anint(d1/xl))
-                                d2 = d2 - yl*(anint(d2/yl))
-                                d3 = d3 - zl*(anint(d3/zl))
-                                rdist2 = d1*d1+d2*d2+d3*d3
+                                if(ortho) then
+                                    ! as fundcell_snglMinImage computes it
+                                    d1 = atvec1%comp(1) - ax(k)
+                                    d2 = atvec1%comp(2) - ay(k)
+                                    d3 = atvec1%comp(3) - az(k)
+                                    d1 = d1 - xl*(anint(d1/xl))
+                                    d2 = d2 - yl*(anint(d2/yl))
+                                    d3 = d3 - zl*(anint(d3/zl))
+                                    rdist2 = d1*d1+d2*d2+d3*d3
+                                else
+                                    Call fundcell_snglMinImage(fcell,atvec1,matvec(k),sepvec,rdist2)
+                                end if
                                 if(rdist2<coeff_surface2*asigma2_n(atype(k))) then
                                     deny=.True.
                                     go to 100
@@ -1173,6 +1228,7 @@ subroutine pore_distribution
     use adsorbent
     use lattice
     use distributions
+    use atomcells, only: atomcells_metric
 
 
     use fundcell, only: fundcell_init, fundamental_cell, fundcell_snglminimage, fundcell_slant, fundcell_isortho
@@ -1187,7 +1243,7 @@ subroutine pore_distribution
     real*8                                :: deldis1, deldis2, deldis
     integer, parameter                    :: nsamples = 10000
     integer, allocatable                  :: sites(:), bins(:)
-    real*8                                :: rmax2, best, v, t, g2, xq(3), lo, hi
+    real*8                                :: rmax2, best, v, t, g2, xq(3), lo, hi, metric
     integer                               :: bsz, nb(3), nblocks, n, d, bx, by, bz, j1, k1, l1
     logical                               :: ortho
     real*8, allocatable                   :: blockmax(:,:,:), bkey(:)
@@ -1245,10 +1301,13 @@ subroutine pore_distribution
     ! that contains its point: upstream scans the cubelets from the largest radius down and
     ! stops at the first that contains it, which is that maximum. Here the cubelets are
     ! grouped in blocks of bsz^3, and the blocks are visited from the largest radius they
-    ! hold down, stopping at the first block that cannot beat the best sphere so far. In
-    ! orthorhombic cells a block farther from the point than its largest radius is skipped.
+    ! hold down, stopping at the first block that cannot beat the best sphere so far. A
+    ! block farther from the point than its largest radius is skipped: the distance is at
+    ! least sqrt(metric) times the slanted gap (module atomcells; metric is 1 in
+    ! orthorhombic cells).
     ! The containment test is upstream's, so the same sphere radius is found.
     ortho = fundcell_isortho(fcell)
+    metric = atomcells_metric()
     rmax2 = PA1(ng_cubes)
     bsz = max(8, int(sqrt(rmax2)/(6.0d0*cube_size)) + 1)
     nb = (/ (ncubesx+bsz-1)/bsz, (ncubesy+bsz-1)/bsz, (ncubesz+bsz-1)/bsz /)
@@ -1303,8 +1362,9 @@ subroutine pore_distribution
             bx = bxs(n)
             by = bys(n)
             bz = bzs(n)
-            if(ortho) then
-                ! smallest (periodic) distance from the point to the block's cubelet centres
+            if(metric > 0.0d0) then
+                ! smallest (periodic, slanted) separation of the point and the block's cubelet
+                ! centres; times metric, a lower bound on the squared distance
                 g2 = 0.0d0
                 do d = 1, 3
                     if(d == 1) j1 = bx
@@ -1317,7 +1377,7 @@ subroutine pore_distribution
                     t = max(0.0d0, abs(t) - 0.5d0*(hi - lo))
                     g2 = g2 + t*t
                 end do
-                if(g2 > bkey(n)*(1.0d0 + 1.0d-9) + 1.0d-9) cycle
+                if(metric*g2 > bkey(n)*(1.0d0 + 1.0d-9) + 1.0d-9) cycle
             end if
             do l1 = bz*bsz+1, min((bz+1)*bsz, ncubesz)
                 do k1 = by*bsz+1, min((by+1)*bsz, ncubesy)

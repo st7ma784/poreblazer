@@ -21,8 +21,12 @@ This fork of [richardjgowers/poreblazer](https://github.com/richardjgowers/poreb
   in ascending atom order, so the Lennard-Jones sum, the overlap test and the nearest
   atom are exactly those found by checking every atom. A cubelet whose nearest atom or
   nearest surface could lie beyond the cutoff (a pore wider than about twice the
-  cutoff) checks every atom, as upstream does. Orthorhombic cells only; other cells
-  check every atom.
+  cutoff) checks every atom, as upstream does. In a non-orthorhombic cell the cells are
+  boxes in its slanted coordinates, searched to the cutoff divided by sqrt(lambda), where
+  lambda bounds the smallest eigenvalue of U^T U for the unslant matrix U (Gershgorin),
+  so the Cartesian distance of any atom outside them is still beyond the cutoff:
+  0.5 for a hexagonal cell. The distances there include the multiplication by U, in
+  the same order as upstream.
 - **Parallel sort** of the cubelets by pore radius before the pore size distribution.
   The order of equal radii can differ from the serial sort, which changes no result.
 - **Faster cluster relabelling** in the percolation analysis: a lookup table instead of
@@ -42,7 +46,7 @@ This fork of [richardjgowers/poreblazer](https://github.com/richardjgowers/poreb
 - **Surface area in parallel, with a cell list.** Every trial draws its two random
   numbers before any test, so the numbers are drawn first, in upstream's order. The
   atoms then run in parallel, and their areas are summed in atom order. The overlap
-  test checks only atoms in nearby cells (orthorhombic cells).
+  test checks only atoms in nearby cells (in any cell shape, as for the lattice step).
 - **Vectorised distances in the lattice step.** Distances to the candidate atoms are
   computed in a loop of their own over contiguous arrays, with the arithmetic of
   `fundcell_snglMinImage`. `anint` is written in a form the compiler vectorises: it
