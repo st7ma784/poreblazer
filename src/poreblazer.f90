@@ -1413,7 +1413,7 @@ subroutine pore_distribution
     use fundcell, only: fundcell_init, fundamental_cell, fundcell_snglminimage, fundcell_slant, fundcell_isortho
     Use vector, only: vectype
     Use random, Only: rranf
-    use parallel, only: par_rank, par_sum_i4_array, par_max_d, par_max_d_array, par_exscan_i8
+    use parallel, only: par_rank, par_size, par_sum_i4_array, par_max_d, par_max_d_array, par_exscan_i8
 
 
     implicit none
@@ -1422,7 +1422,7 @@ subroutine pore_distribution
     integer*8                             :: isite, nn_offset
     integer, allocatable                  :: sxyz(:,:)
     real*8, allocatable                   :: sbest(:)
-    integer                               :: bz0, bz1
+    integer                               :: bz0, bz1, pass
     real*8                                :: sigma_ref, sigma2_ref, rdist2
     real*8                                :: deldis1, deldis2, deldis
     integer, parameter                    :: nsamples = 10000
@@ -1547,12 +1547,20 @@ subroutine pore_distribution
     !$omp end single
     !$omp end parallel
 
+    ! Two passes with MPI. First, the rank holding each sample's cubelet searches its own
+    ! slab; the largest sphere there is usually the answer, and the largest over the ranks is
+    ! then every rank's first answer. Second, the other ranks search theirs, needing only
+    ! spheres larger than that: without it, a rank whose slab cannot contain a better sphere
+    ! would visit every block within reach (in wide pores, most of them). One rank does only
+    ! the first pass, which is the serial search.
+    do pass = 1, min(2, par_size)
     !$omp parallel do default(shared) schedule(dynamic, 16) private(i, n, d, nx, ny, nz, j1, k1, l1, &
     !$omp atvec1, atvec2, sepvec, rdist2, best, v, t, g2, xq, lo, hi, bx, by, bz)
     do i = 1, nsamples
         nx = sxyz(1, i)
         ny = sxyz(2, i)
         nz = sxyz(3, i)
+        if((nz >= z0 .and. nz <= z1) .neqv. (pass == 1)) cycle
 
         atvec1%comp(1) = dble(nx-1)*cube_size+0.5*cube_size ! this is the center of the selected cubelet
         atvec1%comp(2) = dble(ny-1)*cube_size+0.5*cube_size
@@ -1603,8 +1611,9 @@ subroutine pore_distribution
         sbest(i) = best
     end do
     !$omp end parallel do
-    deallocate(blockmax, bkey, bxs, bys, bzs)
     call par_max_d_array(sbest, nsamples)
+    end do
+    deallocate(blockmax, bkey, bxs, bys, bzs)
 
     do i = 1, nsamples
         sigma2_ref = sbest(i)
