@@ -53,7 +53,6 @@ module lattice
         integer*1, allocatable   :: lattice_space_he(:,:,:), lattice_space_n(:,:,:)   ! lattice cubes: cube (i,j,k) is 1 if occupied, 0 if empty (inaccessible) for helim and nitrogen
         integer, allocatable     :: n_cubes(:)                                        ! nitrogen-accessible cubes of this slab, by local cube number (sized to their count)
         real*8, allocatable      :: lattice_lj_he(:,:,:)                              ! for each cube, summary of the LJ interaction between the He atom in the center of the cube and the structure
-        real*8,  allocatable     :: PA1(:)                                            ! pore radii (squared) of this slab's geometrically accessible cubes, sorted ascending
 
 contains
 
@@ -520,14 +519,14 @@ subroutine initialize(filename)
         call par_abort("More than 2**31 grid cubes on one rank; use more MPI ranks or a larger cubelet size")
     call percolation_set_slab(ncubesz, z0)
 
-    allocate(lattice_space(ncubesx, ncubesy, z0:z1), lattice_temp(ncubesx, ncubesy, z0:z1))
+    allocate(lattice_space(ncubesx, ncubesy, z0:z1))   ! lattice_temp: in limiting_diameter
     allocate(lattice_rdist2(ncubesx, ncubesy, z0:z1))
     allocate(lattice_space_he(ncubesx, ncubesy, z0:z1))
     allocate(lattice_space_n(ncubesx, ncubesy, z0:z1))
     allocate(lattice_lj_he(ncubesx, ncubesy, z0:z1))
     allocate(cl_summary(20,2))
 
-    lattice_space = 0; lattice_temp = 0
+    lattice_space = 0
     lattice_rdist2 = 0.0
     lattice_space_he = 0
     lattice_space_n = 0
@@ -596,17 +595,18 @@ subroutine finalize
     ! These arrays are allocated in initialize
     deallocate(aname,asigma,aeps, amass, asigma2, asigma2_he, aeps_he, asigma_n, asigma2_n)
     deallocate(adsname, coords, atype, matvec)
-    deallocate(lattice_space, lattice_temp)
+    deallocate(lattice_space)
+    if(allocated(lattice_temp)) deallocate(lattice_temp)
     deallocate(lattice_rdist2)
-    deallocate(lattice_space_he)
-    deallocate(lattice_space_n)
-    deallocate(lattice_lj_he)
+    if(allocated(lattice_space_he)) deallocate(lattice_space_he)
+    if(allocated(lattice_space_n)) deallocate(lattice_space_n)
+    if(allocated(lattice_lj_he)) deallocate(lattice_lj_he)
     deallocate(cl_summary)
     deallocate(psd_cumul, psd)
 
     ! Allocated in lattice_calculations and pore_distribution
     if(allocated(n_cubes)) deallocate(n_cubes)
-    if(allocated(PA1)) deallocate(PA1)
+
 end subroutine finalize
 
 !--------------------------------------------------------------------------------------
@@ -776,18 +776,7 @@ subroutine lattice_calculations
     ng_cubes = par_sum_i8(int(ng_local, 8))
     nhe_cubes = par_sum_i8(int(nhe_local, 8))
     nn_cubes = par_sum_i8(int(nn_local, 8))
-    allocate(n_cubes(max(1, nn_local)))
-    n_cubes = 0
-    n = 0
-    do l=z0, z1
-        do k=1, ncubesy
-            do j=1, ncubesx
-                if(lattice_space(j,k,l) < 1 .or. lattice_space_n(j,k,l) /= 1) cycle
-                n = n + 1
-                n_cubes(n) = cube_local(j, k, l)
-            end do
-        end do
-    end do
+    ! (the list of nitrogen-accessible cubelets is made after their percolation analysis)
 
     write(*,*) "!-------------------------------------------------------!"
     write(*,*) "! Preliminary lattice complete                          !"
@@ -1056,14 +1045,39 @@ subroutine nitrogen_lattice
     use defaults, only:     radTodeg
 
     implicit none
+    integer :: j, k, l, n
 
     write(*,*) "!-------------------------------------------------------!"
     write(*,*) "! Generation of nitrogen-accessible lattice             !"
     write(*,*) "!-------------------------------------------------------!"
     write(*,*)
 
-    call percolation_calc(lattice_space_n, n_cubes, nn_local, cl_summary)
+    call percolation_calc(lattice_space_n, cl_summary=cl_summary)
+
+    ! The list of this slab's nitrogen-accessible cubelets that percolate, in cubelet order,
+    ! which the PSD samples from: the cubelets the analysis left marked (all of them if no
+    ! cluster could span), as it listed them. Made only now, so that it is not held while
+    ! the grid is labelled.
+    nn_local = 0
+    do l=z0, z1
+        do k=1, ncubesy
+            do j=1, ncubesx
+                if(lattice_space_n(j,k,l) == 1) nn_local = nn_local + 1
+            end do
+        end do
+    end do
     nn_cubes = par_sum_i8(int(nn_local, 8))
+    allocate(n_cubes(max(1, nn_local)))
+    n = 0
+    do l=z0, z1
+        do k=1, ncubesy
+            do j=1, ncubesx
+                if(lattice_space_n(j,k,l) /= 1) cycle
+                n = n + 1
+                n_cubes(n) = cube_local(j, k, l)
+            end do
+        end do
+    end do
 
     ! vusalization options: 1 -xyz, 2 - grd, 3 - both; 0 - none
     if(vis_option == 1) then 
@@ -1148,6 +1162,8 @@ subroutine helium_volume
         if(par_rank == 0) call par_recv_d(buf, 1, par_size - 1, 22)
         pore_v_he = buf(1)
     end if
+    ! nothing reads the helium energies or the helium mask again
+    deallocate(lattice_lj_he, lattice_space_he)
 
     pore_v_he = pore_v_he/dble(ntot)            ! averaging over the whole sample
 
@@ -1413,7 +1429,7 @@ subroutine pore_distribution
     use fundcell, only: fundcell_init, fundamental_cell, fundcell_snglminimage, fundcell_slant, fundcell_isortho
     Use vector, only: vectype
     Use random, Only: rranf
-    use parallel, only: par_rank, par_sum_i4_array, par_max_d, par_max_d_array, par_exscan_i8
+    use parallel, only: par_rank, par_size, par_sum_i4_array, par_max_d, par_max_d_array, par_exscan_i8
 
 
     implicit none
@@ -1422,7 +1438,7 @@ subroutine pore_distribution
     integer*8                             :: isite, nn_offset
     integer, allocatable                  :: sxyz(:,:)
     real*8, allocatable                   :: sbest(:)
-    integer                               :: bz0, bz1
+    integer                               :: bz0, bz1, pass
     real*8                                :: sigma_ref, sigma2_ref, rdist2
     real*8                                :: deldis1, deldis2, deldis
     integer, parameter                    :: nsamples = 10000
@@ -1443,29 +1459,20 @@ subroutine pore_distribution
     psd=0.0
     icount = 0
 
-    ! here we go through all cubelets geometrically accessible, store distances between the centers of cubelets
-    ! and the surface of the nearest neighbour atom in PA1 array, and sort PA1 in an ascending order
-
-    allocate(PA1(max(1, ng_local)))
+    ! Upstream sorted these radii here, for the search below and the limiting diameter; the
+    ! search works by blocks of the grid and needs only the largest, and the limiting
+    ! diameter reads the grid, so no sorted copy is kept (8 bytes per accessible cubelet)
+    rmax2 = -huge(0.0d0)
+    !$omp parallel do default(shared) private(j, k, l) reduction(max:rmax2)
     do l=z0, z1
         do k=1, ncubesy
             do j=1, ncubesx
-                if(lattice_space(j,k,l)<1) cycle
-                icount = icount + 1
-                PA1(icount) = lattice_rdist2(j,k,l)
+                if(lattice_space(j,k,l) >= 1) rmax2 = max(rmax2, lattice_rdist2(j,k,l))
             end do
         end do
     end do
-
-    ! Only the radii are kept and sorted (upstream carried each cubelet's indices along):
-    ! the search below finds spheres by blocks of the grid, and the limiting diameter
-    ! needs only the sorted radii and the cubelets above a radius, which it finds on the grid.
-    ! With MPI each rank sorts its own slab's; the limiting diameter combines them.
-    !$omp parallel default(shared)
-    !$omp single
-    call parallel_sort_values(1, ng_local, PA1)
-    !$omp end single
-    !$omp end parallel
+    !$omp end parallel do
+    rmax2 = par_max_d(rmax2)
 
     if (nn_cubes == 0) then
         ! If there are no nitrogen-accessible cubes, the pore size is zero.
@@ -1508,9 +1515,6 @@ subroutine pore_distribution
     ! only those), and the sample's answer is the largest over the ranks.
     ortho = fundcell_isortho(fcell)
     metric = atomcells_metric()
-    rmax2 = -huge(0.0d0)
-    if(ng_local > 0) rmax2 = PA1(ng_local)
-    rmax2 = par_max_d(rmax2)
     bsz = max(8, int(sqrt(rmax2)/(6.0d0*cube_size)) + 1)
     nb = (/ (ncubesx+bsz-1)/bsz, (ncubesy+bsz-1)/bsz, (ncubesz+bsz-1)/bsz /)
     bz0 = (z0-1)/bsz
@@ -1547,12 +1551,20 @@ subroutine pore_distribution
     !$omp end single
     !$omp end parallel
 
+    ! Two passes with MPI. First, the rank holding each sample's cubelet searches its own
+    ! slab; the largest sphere there is usually the answer, and the largest over the ranks is
+    ! then every rank's first answer. Second, the other ranks search theirs, needing only
+    ! spheres larger than that: without it, a rank whose slab cannot contain a better sphere
+    ! would visit every block within reach (in wide pores, most of them). One rank does only
+    ! the first pass, which is the serial search.
+    do pass = 1, min(2, par_size)
     !$omp parallel do default(shared) schedule(dynamic, 16) private(i, n, d, nx, ny, nz, j1, k1, l1, &
     !$omp atvec1, atvec2, sepvec, rdist2, best, v, t, g2, xq, lo, hi, bx, by, bz)
     do i = 1, nsamples
         nx = sxyz(1, i)
         ny = sxyz(2, i)
         nz = sxyz(3, i)
+        if((nz >= z0 .and. nz <= z1) .neqv. (pass == 1)) cycle
 
         atvec1%comp(1) = dble(nx-1)*cube_size+0.5*cube_size ! this is the center of the selected cubelet
         atvec1%comp(2) = dble(ny-1)*cube_size+0.5*cube_size
@@ -1603,8 +1615,9 @@ subroutine pore_distribution
         sbest(i) = best
     end do
     !$omp end parallel do
-    deallocate(blockmax, bkey, bxs, bys, bzs)
     call par_max_d_array(sbest, nsamples)
+    end do
+    deallocate(blockmax, bkey, bxs, bys, bzs)
 
     do i = 1, nsamples
         sigma2_ref = sbest(i)
@@ -1621,6 +1634,7 @@ subroutine pore_distribution
         end do
     end do
     deallocate(sxyz, sbest, bins)
+    deallocate(n_cubes, lattice_space_n)   ! nothing reads them again
 
     ! rank 0 writes the files (every rank has the same distribution)
     if(par_rank == 0) then
@@ -1705,8 +1719,8 @@ subroutine limiting_diameter
     implicit none
     real*8  :: rhigh, rlow, rmiddle, rmax, rdiff, rdiff_old
     integer :: i, j, percolation_type, i1, k1, l1
-    integer :: nbelow, nlow
-    real*8  :: lmax, lmin, v, low2(2)
+    integer :: nlow
+    real*8  :: lmax, lmin, v, low2(2), top1, top2, t1, t2, vabove
     real*8, allocatable :: lows(:)
 
     write(*,*) "!-------------------------------------------------------!"
@@ -1715,15 +1729,24 @@ subroutine limiting_diameter
     write(*,*) "!-------------------------------------------------------!"
     write(*,*)
 
-    ! The radii are sorted per rank (all of them on one rank); the bisection needs only
-    ! the largest and smallest radius, how many lie below the probe, and the radii next to
-    ! that position in the sorted list of the whole grid, which the ranks find together
+    ! Upstream bisected on a sorted list of the radii. The bisection needs only the largest
+    ! and smallest radius, and at each probe radius rmiddle the radii next to it in that list:
+    ! the second largest below rmiddle (PA1(j-1)) and the smallest not below (PA1(j+1)). These
+    ! are read from the grid as each step marks it, on every rank, with no sorted copy.
+    allocate(lattice_temp(ncubesx, ncubesy, z0:z1))
     lmax = -huge(0.0d0)
     lmin = huge(0.0d0)
-    if(ng_local > 0) then
-        lmax = PA1(ng_local)
-        lmin = PA1(1)
-    end if
+    !$omp parallel do default(shared) private(i1, k1, l1) reduction(max:lmax) reduction(min:lmin)
+    do l1=z0, z1
+        do k1=1, ncubesy
+            do i1=1, ncubesx
+                if(lattice_space(i1,k1,l1) < 1) cycle
+                lmax = max(lmax, lattice_rdist2(i1,k1,l1))
+                lmin = min(lmin, lattice_rdist2(i1,k1,l1))
+            end do
+        end do
+    end do
+    !$omp end parallel do
     rmax  = par_max_d(lmax)
     rhigh = rmax
     rlow  = par_min_d(lmin)
@@ -1737,38 +1760,54 @@ subroutine limiting_diameter
         if(abs(rdiff)<0.25.or.(rdiff==rdiff_old)) exit ! convergence is achieved
         rmiddle = 0.5*(rhigh+rlow)
 
-        ! j, the last sorted radius below rmiddle (as upstream finds it), is the number of
-        ! radii below rmiddle: nbelow on this rank
-        nbelow = count_below(rmiddle)
-
         ! the geometrically accessible cubelets with a radius of at least rmiddle (upstream
-        ! marked the sorted entries above j, the same cubelets)
-        !$omp parallel do default(shared) private(i1, k1, l1)
+        ! marked the sorted entries above j, the last radius below rmiddle: the same cubelets),
+        ! with the two largest radii below rmiddle and the smallest not below it
+        top1 = -huge(0.0d0)
+        top2 = -huge(0.0d0)
+        vabove = huge(0.0d0)
+        !$omp parallel default(shared) private(i1, k1, l1, v, t1, t2)
+        t1 = -huge(0.0d0)
+        t2 = -huge(0.0d0)
+        !$omp do reduction(min:vabove)
         do l1=z0, z1
             do k1=1, ncubesy
                 do i1=1, ncubesx
                     lattice_temp(i1,k1,l1) = 0
-                    if(lattice_space(i1,k1,l1) >= 1) then
-                        if(.not. (lattice_rdist2(i1,k1,l1) < rmiddle)) lattice_temp(i1,k1,l1) = 1
+                    if(lattice_space(i1,k1,l1) < 1) cycle
+                    v = lattice_rdist2(i1,k1,l1)
+                    if(.not. (v < rmiddle)) then
+                        lattice_temp(i1,k1,l1) = 1
+                        vabove = min(vabove, v)
+                    else if(v > t1) then
+                        t2 = t1
+                        t1 = v
+                    else if(v > t2) then
+                        t2 = v
                     end if
                 end do
             end do
         end do
-        !$omp end parallel do
+        !$omp end do
+        !$omp critical
+        call keep_two_largest(t1, top1, top2)
+        call keep_two_largest(t2, top1, top2)
+        !$omp end critical
+        !$omp end parallel
 
         call percolation_calc_simple(lattice_temp, cl_summary, spanning)
 
         if(spanning>0) then
-            ! PA1(j-1): the second largest radius below rmiddle, counting repeats (the
-            ! smallest radius if there is only one)
+            ! PA1(j-1): the second largest radius below rmiddle over the ranks, counting
+            ! repeats (the smallest radius if there is only one below)
             nlow = 0
-            if(nbelow >= 1) then
+            if(top1 > -huge(0.0d0)) then
                 nlow = nlow + 1
-                low2(nlow) = PA1(nbelow)
+                low2(nlow) = top1
             end if
-            if(nbelow >= 2) then
+            if(top2 > -huge(0.0d0)) then
                 nlow = nlow + 1
-                low2(nlow) = PA1(nbelow-1)
+                low2(nlow) = top2
             end if
             call par_allgather_d(low2(1:nlow), lows)
             if(size(lows) >= 2) then
@@ -1781,14 +1820,13 @@ subroutine limiting_diameter
             cycle
         else
             ! PA1(j+1): the smallest radius not below rmiddle (the largest if there is none)
-            v = huge(0.0d0)
-            if(nbelow < ng_local) v = PA1(nbelow+1)
-            rhigh = par_min_d(v)
+            rhigh = par_min_d(vabove)
             if(rhigh == huge(0.0d0)) rhigh = rmax
             cycle
         end if
 
     end do
+    deallocate(lattice_temp)
 
     write(*,'(a,f12.2)') ' Pore limiting diameter in A: ', 2.0*sqrt(rhigh)
     write(*,'(a,f12.2)') ' Maximum pore diameter in A:  ', 2.0*sqrt(rmax)
@@ -1816,22 +1854,17 @@ subroutine limiting_diameter
 
 contains
 
-    ! How many of this rank's sorted radii are below r (binary search)
-    integer function count_below(r)
-        real*8, intent(in) :: r
-        integer            :: lo, hi, mid
-        lo = 0
-        hi = ng_local
-        do while(lo < hi)
-            mid = lo + (hi - lo + 1)/2
-            if(PA1(mid) < r) then
-                lo = mid
-            else
-                hi = mid - 1
-            end if
-        end do
-        count_below = lo
-    end function count_below
+    ! Keep a and b the largest and second largest of the values offered so far (with repeats)
+    subroutine keep_two_largest(x, a, b)
+        real*8, intent(in)    :: x
+        real*8, intent(inout) :: a, b
+        if(x > a) then
+            b = a
+            a = x
+        else if(x > b) then
+            b = x
+        end if
+    end subroutine keep_two_largest
 
     ! The second largest of v, counting repeats
     real*8 function second_largest(v)
