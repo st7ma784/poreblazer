@@ -175,3 +175,30 @@ the grid. Global cube counts are 8-byte, so a grid may hold more than 2**31 cube
 may hold up to 2**31.
 
 `POREBLAZER_TIMING=1` makes rank 0 write each step's wall time to stderr (not the log).
+
+## Where the grid falls
+
+Poreblazer starts its grid at the lowest atom. `POREBLAZER_GRID_OFFSET="fx fy fz"` moves the
+structure against the grid by those fractions of a cubelet along the cell's sides (the log
+says `Grid offset (cubelets): ...`), so the spread of a result over offsets shows how much
+of it is where the grid happens to fall. A whole number of cubelets changes no result in a
+cell that is a whole number of cubelets on every side (`tests/run_tests.py --grid-offset`).
+Only the first side is fitted to the cubelet, as in 3.0.5: on the others, up to one
+cubelet's width of the cell is left out of the grid, and an offset moves that strip.
+
+Measured on the three Ambuild cells in `tests/cases`, 16 random offsets at each cubelet
+size, against the mean of 4 offsets at 0.1 A (exact labelling, November 2026):
+
+| Result | Spread over offsets (sd) at 0.2 A | Error at 0.2 A, one offset | Averaging offsets |
+| --- | --- | --- | --- |
+| Pore limiting diameter | 0.01-0.03 A | -0.02 to -0.09 A | does not help: the error is a bias, about -0.6 to -0.7 A per A of cubelet in the two open cells |
+| Maximum pore diameter | 0.02-0.03 A | -0.05 to -0.08 A | does not help, as above |
+| Geometric volume | up to 0.004% of the volume | up to 0.003% | removes it (mean within 0.0003%) |
+| Helium volume | under 0.00002% | none | converged already |
+| Surface area | none up to 0.35 A | none | does not help at 0.7 A, where it is 2% low: a bias |
+| Percolation dimensions | none at 0.2-0.7 A | see below | |
+
+In the dense 30 A cell the network percolates in 3 dimensions at 2 of the 4 offsets at
+0.1 A, and in 1 dimension at the other two and at every one of the 64 runs from 0.2 to
+0.7 A: a channel whose narrowest point is close to the probe's size is found or missed
+by where the grid falls. A dimension count from one grid is uncertain for such cells.

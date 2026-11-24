@@ -53,6 +53,10 @@ jobs:
         run: python3 tests/run_tests.py --fork src/poreblazer.exe --upstream /tmp/upstream/src/poreblazer.exe --threads 1 4
       - name: The MPI build matches the exact reference on 1 to 4 ranks
         run: python3 tests/run_tests.py --fork src/poreblazer-mpi.exe --mpi 1 2 3 4 --mpirun "mpirun --oversubscribe" --threads 1
+      - name: A grid offset of whole cubelets changes no result (cells a whole number of cubelets on each side)
+        run: |
+          python3 tests/run_tests.py --fork src/poreblazer.exe --threads 2 --grid-offset "-2 3 1" \
+              --cases HKUST1 IRMOF1 ambuild_20A ambuild_30A_dense ambuild_40A_sparse
 
   image:
     needs: test

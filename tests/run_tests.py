@@ -45,6 +45,7 @@ CASES = [
 EXACT_REFERENCE = os.path.join(HERE, "reference_exact.json")
 LABELLING_LINE = "Percolation labelling:"
 RANKS_LINE = "MPI ranks:"
+OFFSET_LINE = "Grid offset (cubelets):"
 
 
 def defaults_dat(case_dir, cubelet, labelling):
@@ -61,9 +62,9 @@ def defaults_dat(case_dir, cubelet, labelling):
     return "\n".join(values) + "\n\n"
 
 
-def run(exe, case, threads, labelling, launcher=()):
-    """Run exe on a case; return the log (less the labelling line), the sha256 of every
-    file written, and the wall time"""
+def run(exe, case, threads, labelling, launcher=(), env_extra=None):
+    """Run exe on a case; return the log (less the lines naming the labelling, the ranks and
+    the grid offset), the sha256 of every file written, and the wall time"""
     name, case_dir, cubelet = case
     rundir = tempfile.mkdtemp(prefix="pb_%s_" % name)
     try:
@@ -82,7 +83,7 @@ def run(exe, case, threads, labelling, launcher=()):
         inputs.add("defaults.dat")
         with open(os.path.join(rundir, "input.dat")) as f:
             stdin = f.read()
-        env = dict(os.environ, OMP_NUM_THREADS=str(threads))
+        env = dict(os.environ, OMP_NUM_THREADS=str(threads), **(env_extra or {}))
         start = time.time()
         proc = subprocess.run(list(launcher) + [os.path.abspath(exe)], input=stdin, cwd=rundir, env=env,
                               capture_output=True, text=True)
@@ -90,7 +91,8 @@ def run(exe, case, threads, labelling, launcher=()):
         if proc.returncode != 0:
             raise RuntimeError("%s failed on %s (exit %d):\n%s" % (exe, name, proc.returncode,
                                                                    proc.stderr[-2000:]))
-        log = [line for line in proc.stdout.splitlines() if LABELLING_LINE not in line and RANKS_LINE not in line]
+        log = [line for line in proc.stdout.splitlines()
+               if LABELLING_LINE not in line and RANKS_LINE not in line and OFFSET_LINE not in line]
         files = {}
         for entry in sorted(os.listdir(rundir)):
             if entry in inputs:
@@ -131,10 +133,34 @@ def main():
                         help="--fork is the MPI build (make mpi): run exact labelling under mpirun on each number "
                              "of ranks and check it against the reference")
     parser.add_argument("--mpirun", default="mpirun", help="the MPI launcher (default mpirun)")
+    parser.add_argument("--grid-offset", metavar='"FX FY FZ"',
+                        help="run exact labelling with POREBLAZER_GRID_OFFSET set to whole cubelets, whose log must "
+                             "match the reference's for cells that are a whole number of cubelets on every side (the "
+                             "files differ: the grid is numbered from another cube)")
     args = parser.parse_args()
     cases = [c for c in CASES if not args.cases or c[0] in args.cases]
 
     failures = []
+    if args.grid_offset:
+        with open(EXACT_REFERENCE) as f:
+            exact_reference = json.load(f)
+
+        def moved(r):
+            return {"log": r["log"], "files": {}}
+
+        for case in cases:
+            for threads in args.threads:
+                r = run(args.fork, case, threads, "exact", env_extra={"POREBLAZER_GRID_OFFSET": args.grid_offset})
+                diff = differences(moved(r), moved(exact_reference[case[0]]))
+                if diff:
+                    failures.append("%s offset %s, %d threads: %s" % (case[0], args.grid_offset, threads, "; ".join(diff)))
+                print("%-20s offset %s %2d threads %6.1f s  %s" % (
+                    case[0], args.grid_offset, threads, r["wall"],
+                    "matches reference" if not diff else "DIFFERS: " + "; ".join(diff)), flush=True)
+        for f in failures:
+            print("  " + f)
+        return 1 if failures else 0
+
     if args.mpi:
         with open(EXACT_REFERENCE) as f:
             exact_reference = json.load(f)
